@@ -1,10 +1,15 @@
 # main.py
 # PAI-Car stabilized PD controller
-# - center deadband and steering smoothing
-# - continuous curve-speed planner
-# - speed-dependent gain scheduling
+#
+# Features:
+# - center deadband
+# - filtered PD control
+# - gain scheduling
+# - curve-based speed planning
 # - staged line-loss recovery
-# - UDP telemetry/debug support
+# - consecutive line reacquisition confirmation
+# - filter reset after reacquisition
+# - independent binary/text UDP options
 
 from time import ticks_ms, ticks_diff
 import socket
@@ -39,7 +44,13 @@ from modules.pai_car_wifi_config import (
 
 DEBUG_MODE = True
 
-# 우선 10 ms에서 안정화한다.
+# Binary telemetry is relatively lightweight.
+ENABLE_BINARY_TELEMETRY = True
+
+# Text formatting and UDP transmission caused long loop overruns.
+# Keep this False for normal tuning runs.
+ENABLE_TEXT_DEBUG = False
+
 DEBUG_CONTROL_MS = 10
 RACE_CONTROL_MS = 10
 
@@ -57,7 +68,9 @@ udp_telemetry.CONTROL_MS = CONTROL_PERIOD_MS
 # ============================================================
 
 DEBUG_PC_PORT = PC_PORT + 1
-DEBUG_REPORT_MS = 1000
+
+# Only used when ENABLE_TEXT_DEBUG is True.
+DEBUG_REPORT_MS = 3000
 
 OVERRUN_THRESHOLD_MS = CONTROL_PERIOD_MS
 
@@ -66,23 +79,15 @@ OVERRUN_THRESHOLD_MS = CONTROL_PERIOD_MS
 # 3. Speed planner settings
 # ============================================================
 
-# 코스 대부분이 곡선이므로 최고속보다 안정적인 평균속도를 우선한다.
 MAX_TRACK_SPEED = 580
-MEDIUM_CURVE_SPEED = 430
+MEDIUM_CURVE_SPEED = 460
 SHARP_CURVE_SPEED = 280
 VERY_SHARP_SPEED = 220
 LOW_CONFIDENCE_SPEED = 230
 
-# 라인 복구용 출력
-RECOVERY_FORWARD_SPEED = 180
-RECOVERY_TURN_SPEED = 330
-RECOVERY_PIVOT_SPEED = 260
-
-# 속도 변화율
 SPEED_RISE_STEP = 5
 SPEED_FALL_STEP = 35
 
-# 곡선 위험도 경계
 CURVE_SCORE_MEDIUM = 0.22
 CURVE_SCORE_SHARP = 0.46
 CURVE_SCORE_VERY_SHARP = 0.72
@@ -102,7 +107,6 @@ CURVE_ACCEL_WEIGHT = 0.10
 # 4. PD controller settings
 # ============================================================
 
-# 중앙 부근에서는 낮은 Kp와 높은 Kd로 좌우 진동을 억제한다.
 KP_STRAIGHT = 0.20
 KP_CURVE = 0.28
 KP_SHARP = 0.36
@@ -111,20 +115,17 @@ KD_STRAIGHT = 0.85
 KD_CURVE = 0.75
 KD_SHARP = 0.55
 
-# 중앙 근처의 작은 센서 오차는 조향에 반영하지 않는다.
 ERROR_DEADBAND = 90.0
 
-# 상태별 최대 조향량
 MAX_STEERING_STRAIGHT = 300
 MAX_STEERING_CURVE = 430
 MAX_STEERING_SHARP = 560
 
-# 조향 명령 자체를 평활한다.
 STEERING_FILTER_ALPHA = 0.35
 
 
 # ============================================================
-# 5. Sensor feature settings
+# 5. Sensor settings
 # ============================================================
 
 SENSOR_ACTIVE_THRESHOLD = 300
@@ -161,20 +162,53 @@ ALLOW_REVERSE_TRACKING = False
 
 
 # ============================================================
-# 8. Recovery settings and states
+# 8. Recovery settings
 # ============================================================
 
+# Keep previous commands for very short sensor dropouts.
 LOST_GRACE_MS = 25
-SOFT_SEARCH_MS = 180
-HARD_SEARCH_MS = 450
 
-REACQUIRE_MS = 100
+# Forward differential search.
+SOFT_SEARCH_MS = 180
+
+# One-wheel pivot search is allowed only until this time.
+HARD_SEARCH_MS = 550
+
+# Recovery motor commands.
+RECOVERY_FORWARD_SPEED = 180
+RECOVERY_TURN_SPEED = 330
+RECOVERY_PIVOT_SPEED = 260
+
+# After HARD_SEARCH_MS, stop rotating aggressively and move forward
+# with a weaker steering difference.
+RECOVERY_WIDE_INNER_SPEED = 130
+RECOVERY_WIDE_OUTER_SPEED = 260
+
+# A line must be detected this many consecutive loops before recovery
+# is considered successful.
+REACQUIRE_CONFIRM_COUNT = 5
+
+# Reacquisition stabilization phase.
+REACQUIRE_MS = 150
+REACQUIRE_SPEED = 240
+REACQUIRE_MAX_STEERING = 300
+
+# While confirming the line, use a gentle correction.
+REACQUIRE_CONFIRM_INNER_SPEED = 160
+REACQUIRE_CONFIRM_OUTER_SPEED = 240
+
+
+# ============================================================
+# 9. States
+# ============================================================
 
 STATE_TRACKING = 0
 STATE_LOST_GRACE = 1
 STATE_SOFT_SEARCH = 2
 STATE_HARD_SEARCH = 3
-STATE_REACQUIRE = 4
+STATE_WIDE_SEARCH = 4
+STATE_REACQUIRE_CONFIRM = 5
+STATE_REACQUIRE = 6
 
 SPEED_STATE_FAST = 0
 SPEED_STATE_CURVE = 1
@@ -185,10 +219,14 @@ SPEED_STATE_RECOVERY = 5
 
 
 # ============================================================
-# 9. Common helpers
+# 10. Common helpers
 # ============================================================
 
-def clamp(value, minimum, maximum):
+def clamp(
+    value,
+    minimum,
+    maximum,
+):
     if value < minimum:
         return minimum
 
@@ -239,7 +277,7 @@ def read_sensor_data(line):
 
 
 # ============================================================
-# 10. Sensor feature extraction
+# 11. Sensor feature extraction
 # ============================================================
 
 def calculate_line_width(norm):
@@ -247,7 +285,10 @@ def calculate_line_width(norm):
     current = 0
 
     for value in norm:
-        if value >= SENSOR_ACTIVE_THRESHOLD:
+        if (
+            value
+            >= SENSOR_ACTIVE_THRESHOLD
+        ):
             current += 1
 
             if current > longest:
@@ -271,7 +312,10 @@ def extract_features(
     for value in norm:
         sensor_sum += value
 
-        if value >= SENSOR_ACTIVE_THRESHOLD:
+        if (
+            value
+            >= SENSOR_ACTIVE_THRESHOLD
+        ):
             active_count += 1
 
     if SENSOR_SUM_FULL > 0:
@@ -305,7 +349,7 @@ def extract_features(
             previous_filtered_error
         )
 
-    # 10 ms 제어 기준 변화량으로 환산한다.
+    # Normalize the derivative to a 10 ms reference period.
     period_scale = (
         10.0
         / CONTROL_PERIOD_MS
@@ -397,11 +441,31 @@ def create_empty_features():
     }
 
 
+def reset_features_after_reacquire(
+    error,
+    norm,
+):
+    """
+    Rebuild features without carrying the old derivative or steering
+    state across the recovery boundary.
+    """
+
+    return extract_features(
+        error,
+        True,
+        norm,
+        error,
+        0.0,
+    )
+
+
 # ============================================================
-# 11. Curve score and speed planner
+# 12. Curve score and speed planner
 # ============================================================
 
-def calculate_curve_score(features):
+def calculate_curve_score(
+    features
+):
     error_component = clamp(
         abs(
             features[
@@ -541,7 +605,7 @@ def get_speed_state_name(
 
 
 # ============================================================
-# 12. Gain scheduling and steering
+# 13. Gain scheduling and steering
 # ============================================================
 
 def get_control_gains(
@@ -651,7 +715,7 @@ def calculate_steering(
 
 
 # ============================================================
-# 13. Motor mixer
+# 14. Motor mixer
 # ============================================================
 
 def apply_motor_deadzone(
@@ -836,7 +900,7 @@ def mix_motor_commands(
 
 
 # ============================================================
-# 14. Line-loss recovery controller
+# 15. Line-loss recovery
 # ============================================================
 
 def calculate_recovery_commands(
@@ -845,7 +909,7 @@ def calculate_recovery_commands(
     previous_left_cmd,
     previous_right_cmd,
 ):
-    # 1~2프레임 미검출은 순간적인 센서 누락으로 간주한다.
+    # Brief sensor dropout: keep the previous motor commands.
     if (
         lost_elapsed_ms
         <= LOST_GRACE_MS
@@ -856,7 +920,7 @@ def calculate_recovery_commands(
             previous_right_cmd,
         )
 
-    # 마지막으로 라인이 보였던 방향으로 완만하게 회전한다.
+    # Soft forward differential search.
     if (
         lost_elapsed_ms
         <= SOFT_SEARCH_MS
@@ -874,27 +938,67 @@ def calculate_recovery_commands(
             RECOVERY_FORWARD_SPEED,
         )
 
-    # 장기 미검출에서는 한쪽 바퀴를 정지하여 더 강하게 회전한다.
-    if last_valid_error < 0:
+    # Strong pivot search, but only for a limited duration.
+    if (
+        lost_elapsed_ms
+        <= HARD_SEARCH_MS
+    ):
+        if last_valid_error < 0:
+            return (
+                STATE_HARD_SEARCH,
+                0,
+                RECOVERY_PIVOT_SPEED,
+            )
+
         return (
             STATE_HARD_SEARCH,
-            0,
             RECOVERY_PIVOT_SPEED,
+            0,
+        )
+
+    # After the pivot timeout, avoid continuing to rotate indefinitely.
+    # Move forward with a weaker steering difference.
+    if last_valid_error < 0:
+        return (
+            STATE_WIDE_SEARCH,
+            RECOVERY_WIDE_INNER_SPEED,
+            RECOVERY_WIDE_OUTER_SPEED,
         )
 
     return (
-        STATE_HARD_SEARCH,
-        RECOVERY_PIVOT_SPEED,
-        0,
+        STATE_WIDE_SEARCH,
+        RECOVERY_WIDE_OUTER_SPEED,
+        RECOVERY_WIDE_INNER_SPEED,
+    )
+
+
+def calculate_reacquire_confirm_commands(
+    error
+):
+    """
+    Use the currently detected error only for a gentle confirmation
+    movement. Normal PD control resumes only after consecutive
+    detections have been confirmed.
+    """
+
+    if error < 0:
+        return (
+            REACQUIRE_CONFIRM_INNER_SPEED,
+            REACQUIRE_CONFIRM_OUTER_SPEED,
+        )
+
+    return (
+        REACQUIRE_CONFIRM_OUTER_SPEED,
+        REACQUIRE_CONFIRM_INNER_SPEED,
     )
 
 
 # ============================================================
-# 15. Wireless debug UDP
+# 16. Wireless debug UDP
 # ============================================================
 
 def create_debug_socket():
-    if not DEBUG_MODE:
+    if not ENABLE_TEXT_DEBUG:
         return None
 
     try:
@@ -945,6 +1049,8 @@ def send_debug_report(
     max_loop_ms,
     last_loop_ms,
     drive_state,
+    recovering,
+    reacquire_count,
     features,
     target_speed,
     current_speed,
@@ -966,6 +1072,8 @@ def send_debug_report(
         "type=status,"
         "loop={},"
         "drive={},"
+        "recovering={},"
+        "reacquire_count={},"
         "speed_state={},"
         "target={},"
         "current={},"
@@ -990,6 +1098,8 @@ def send_debug_report(
     ).format(
         loop_count,
         drive_state,
+        int(recovering),
+        reacquire_count,
         get_speed_state_name(
             speed_state
         ),
@@ -1086,12 +1196,17 @@ def send_final_report(
 
 
 # ============================================================
-# 16. OLED
+# 17. OLED
 # ============================================================
 
 def show_running_mode(lap_timer):
     if DEBUG_MODE:
-        mode_name = "DEBUG UDP"
+        if ENABLE_TEXT_DEBUG:
+            mode_name = "DEBUG FULL"
+        elif ENABLE_BINARY_TELEMETRY:
+            mode_name = "DEBUG BIN"
+        else:
+            mode_name = "DEBUG OFF"
     else:
         mode_name = "RACE"
 
@@ -1109,7 +1224,7 @@ def show_running_mode(lap_timer):
 
 
 # ============================================================
-# 17. Main
+# 18. Main
 # ============================================================
 
 def run():
@@ -1130,6 +1245,14 @@ def run():
 
     line_lost_count = 0
 
+    wifi_enabled = (
+        DEBUG_MODE
+        and (
+            ENABLE_BINARY_TELEMETRY
+            or ENABLE_TEXT_DEBUG
+        )
+    )
+
     try:
         lap_timer = create_lap_timer()
 
@@ -1141,32 +1264,41 @@ def run():
             lap_timer
         )
 
-        if DEBUG_MODE:
+        if wifi_enabled:
             telemetry = PAIUdpTelemetry(
                 lap_timer
             )
 
             telemetry.begin()
 
-            debug_socket = (
-                create_debug_socket()
-            )
+            if ENABLE_TEXT_DEBUG:
+                debug_socket = (
+                    create_debug_socket()
+                )
 
-            send_debug_message(
-                debug_socket,
-                (
-                    "type=boot,"
-                    "control_ms={},"
-                    "max_speed={},"
-                    "kp_straight={:.3f},"
-                    "kd_straight={:.3f}"
-                ).format(
-                    CONTROL_PERIOD_MS,
-                    MAX_TRACK_SPEED,
-                    KP_STRAIGHT,
-                    KD_STRAIGHT,
-                ),
-            )
+                send_debug_message(
+                    debug_socket,
+                    (
+                        "type=boot,"
+                        "control_ms={},"
+                        "max_speed={},"
+                        "kp_straight={:.3f},"
+                        "kd_straight={:.3f},"
+                        "binary={},"
+                        "text={}"
+                    ).format(
+                        CONTROL_PERIOD_MS,
+                        MAX_TRACK_SPEED,
+                        KP_STRAIGHT,
+                        KD_STRAIGHT,
+                        int(
+                            ENABLE_BINARY_TELEMETRY
+                        ),
+                        int(
+                            ENABLE_TEXT_DEBUG
+                        ),
+                    ),
+                )
 
         self_calibrate_or_stop(
             line,
@@ -1236,10 +1368,11 @@ def run():
 
         last_valid_error = 0.0
 
+        recovering = False
         lost_start_ms = None
-        reacquire_start_ms = None
 
-        previous_on_line = True
+        reacquire_count = 0
+        reacquire_start_ms = None
 
         last_debug_report_ms = (
             ticks_ms()
@@ -1247,7 +1380,6 @@ def run():
 
         while True:
             loop_start = ticks_ms()
-
             loop_count += 1
 
             (
@@ -1258,41 +1390,6 @@ def run():
                 is_marker,
             ) = read_sensor_data(
                 line
-            )
-
-            features = extract_features(
-                error,
-                on_line,
-                norm,
-                previous_filtered_error,
-                previous_filtered_derivative,
-            )
-
-            previous_filtered_error = (
-                features[
-                    "filtered_error"
-                ]
-            )
-
-            previous_filtered_derivative = (
-                features[
-                    "filtered_error_rate"
-                ]
-            )
-
-            curve_score = (
-                calculate_curve_score(
-                    features
-                )
-            )
-
-            (
-                target_speed,
-                speed_state,
-            ) = calculate_target_speed(
-                curve_score,
-                features,
-                on_line,
             )
 
             if lap_timer.check_finish(
@@ -1309,7 +1406,10 @@ def run():
 
                 finished = True
 
-                if telemetry is not None:
+                if (
+                    telemetry is not None
+                    and ENABLE_BINARY_TELEMETRY
+                ):
                     telemetry.send_now(
                         current_speed,
                         norm,
@@ -1340,46 +1440,249 @@ def run():
 
                 break
 
-            if on_line:
+            # ------------------------------------------------
+            # A. Start a physical recovery event
+            # ------------------------------------------------
+
+            if (
+                not recovering
+                and not on_line
+            ):
+                recovering = True
+
+                line_lost_count += 1
+
+                lost_start_ms = (
+                    ticks_ms()
+                )
+
+                reacquire_count = 0
+                reacquire_start_ms = None
+
+            # ------------------------------------------------
+            # B. Recovery and reacquisition confirmation
+            # ------------------------------------------------
+
+            if recovering:
+                if on_line:
+                    reacquire_count += 1
+                else:
+                    reacquire_count = 0
+
+                if (
+                    on_line
+                    and reacquire_count
+                    >= REACQUIRE_CONFIRM_COUNT
+                ):
+                    # Confirmed reacquisition.
+                    recovering = False
+
+                    drive_state = (
+                        STATE_REACQUIRE
+                    )
+
+                    reacquire_start_ms = (
+                        ticks_ms()
+                    )
+
+                    lost_start_ms = None
+                    reacquire_count = 0
+
+                    # Reset stale controller state.
+                    previous_filtered_error = (
+                        error
+                    )
+
+                    previous_filtered_derivative = (
+                        0.0
+                    )
+
+                    previous_steering = 0
+
+                    features = (
+                        reset_features_after_reacquire(
+                            error,
+                            norm,
+                        )
+                    )
+
+                    previous_filtered_error = (
+                        features[
+                            "filtered_error"
+                        ]
+                    )
+
+                    previous_filtered_derivative = (
+                        features[
+                            "filtered_error_rate"
+                        ]
+                    )
+
+                    last_valid_error = (
+                        features[
+                            "filtered_error"
+                        ]
+                    )
+
+                else:
+                    # Recovery is still active.
+                    if (
+                        lost_start_ms
+                        is None
+                    ):
+                        lost_start_ms = (
+                            ticks_ms()
+                        )
+
+                    lost_elapsed_ms = (
+                        ticks_diff(
+                            ticks_ms(),
+                            lost_start_ms,
+                        )
+                    )
+
+                    if on_line:
+                        drive_state = (
+                            STATE_REACQUIRE_CONFIRM
+                        )
+
+                        (
+                            left_cmd,
+                            right_cmd,
+                        ) = (
+                            calculate_reacquire_confirm_commands(
+                                error
+                            )
+                        )
+                    else:
+                        (
+                            drive_state,
+                            left_cmd,
+                            right_cmd,
+                        ) = calculate_recovery_commands(
+                            lost_elapsed_ms,
+                            last_valid_error,
+                            previous_left_cmd,
+                            previous_right_cmd,
+                        )
+
+                    target_speed = (
+                        RECOVERY_FORWARD_SPEED
+                    )
+
+                    current_speed = (
+                        RECOVERY_FORWARD_SPEED
+                    )
+
+                    speed_state = (
+                        SPEED_STATE_RECOVERY
+                    )
+
+                    steering = 0
+                    p_term = 0.0
+                    d_term = 0.0
+                    kp = 0.0
+                    kd = 0.0
+
+                    saturation_scale = 1.0
+
+                    motors.drive(
+                        left_cmd,
+                        right_cmd,
+                    )
+
+            # ------------------------------------------------
+            # C. Normal tracking or stabilized reacquisition
+            # ------------------------------------------------
+
+            if not recovering:
+                if (
+                    drive_state
+                    != STATE_REACQUIRE
+                ):
+                    features = extract_features(
+                        error,
+                        on_line,
+                        norm,
+                        previous_filtered_error,
+                        previous_filtered_derivative,
+                    )
+
+                    previous_filtered_error = (
+                        features[
+                            "filtered_error"
+                        ]
+                    )
+
+                    previous_filtered_derivative = (
+                        features[
+                            "filtered_error_rate"
+                        ]
+                    )
+
                 last_valid_error = (
                     features[
                         "filtered_error"
                     ]
                 )
 
-                if not previous_on_line:
-                    reacquire_start_ms = (
-                        ticks_ms()
+                curve_score = (
+                    calculate_curve_score(
+                        features
                     )
+                )
 
-                lost_start_ms = None
+                (
+                    target_speed,
+                    speed_state,
+                ) = calculate_target_speed(
+                    curve_score,
+                    features,
+                    True,
+                )
+
+                in_reacquire_phase = False
 
                 if (
                     reacquire_start_ms
                     is not None
-                    and ticks_diff(
-                        ticks_ms(),
-                        reacquire_start_ms,
-                    ) < REACQUIRE_MS
                 ):
-                    drive_state = (
-                        STATE_REACQUIRE
+                    reacquire_elapsed_ms = (
+                        ticks_diff(
+                            ticks_ms(),
+                            reacquire_start_ms,
+                        )
                     )
 
-                    target_speed = min(
-                        target_speed,
-                        SHARP_CURVE_SPEED,
-                    )
+                    if (
+                        reacquire_elapsed_ms
+                        < REACQUIRE_MS
+                    ):
+                        in_reacquire_phase = (
+                            True
+                        )
+
+                        drive_state = (
+                            STATE_REACQUIRE
+                        )
+
+                        target_speed = min(
+                            target_speed,
+                            REACQUIRE_SPEED,
+                        )
+                    else:
+                        reacquire_start_ms = (
+                            None
+                        )
+
+                        drive_state = (
+                            STATE_TRACKING
+                        )
                 else:
                     drive_state = (
                         STATE_TRACKING
                     )
 
-                    reacquire_start_ms = (
-                        None
-                    )
-
-                # T 마커나 넓은 선에서는 직전 조향을 천천히 감소시킨다.
                 if features["wide_line"]:
                     steering = int(
                         previous_steering
@@ -1401,6 +1704,15 @@ def run():
                         features,
                         curve_score,
                         previous_steering,
+                    )
+
+                if in_reacquire_phase:
+                    steering = int(
+                        clamp(
+                            steering,
+                            -REACQUIRE_MAX_STEERING,
+                            REACQUIRE_MAX_STEERING,
+                        )
                     )
 
                 current_speed = move_toward(
@@ -1436,66 +1748,17 @@ def run():
                     steering
                 )
 
-            else:
-                if previous_on_line:
-                    line_lost_count += 1
-
-                    lost_start_ms = (
-                        ticks_ms()
-                    )
-
-                if lost_start_ms is None:
-                    lost_start_ms = (
-                        ticks_ms()
-                    )
-
-                lost_elapsed_ms = ticks_diff(
-                    ticks_ms(),
-                    lost_start_ms,
-                )
-
-                (
-                    drive_state,
-                    left_cmd,
-                    right_cmd,
-                ) = calculate_recovery_commands(
-                    lost_elapsed_ms,
-                    last_valid_error,
-                    previous_left_cmd,
-                    previous_right_cmd,
-                )
-
-                target_speed = (
-                    RECOVERY_FORWARD_SPEED
-                )
-
-                current_speed = (
-                    RECOVERY_FORWARD_SPEED
-                )
-
-                speed_state = (
-                    SPEED_STATE_RECOVERY
-                )
-
-                steering = 0
-                p_term = 0.0
-                d_term = 0.0
-                kp = 0.0
-                kd = 0.0
-
-                saturation_scale = 1.0
-
-                motors.drive(
-                    left_cmd,
-                    right_cmd,
-                )
-
-            previous_on_line = on_line
-
             previous_left_cmd = left_cmd
             previous_right_cmd = right_cmd
 
-            if telemetry is not None:
+            # ------------------------------------------------
+            # D. Binary telemetry
+            # ------------------------------------------------
+
+            if (
+                telemetry is not None
+                and ENABLE_BINARY_TELEMETRY
+            ):
                 telemetry.send_if_due(
                     current_speed,
                     norm,
@@ -1513,6 +1776,10 @@ def run():
                 )
 
             lap_timer.update()
+
+            # ------------------------------------------------
+            # E. Loop execution-time measurement
+            # ------------------------------------------------
 
             compute_end = ticks_ms()
 
@@ -1539,7 +1806,14 @@ def run():
             ):
                 overrun_count += 1
 
-            if DEBUG_MODE:
+            # ------------------------------------------------
+            # F. Optional text debug
+            # ------------------------------------------------
+
+            if (
+                DEBUG_MODE
+                and ENABLE_TEXT_DEBUG
+            ):
                 now = ticks_ms()
 
                 if ticks_diff(
@@ -1554,6 +1828,8 @@ def run():
                         max_loop_ms,
                         last_loop_ms,
                         drive_state,
+                        recovering,
+                        reacquire_count,
                         features,
                         target_speed,
                         current_speed,
@@ -1646,7 +1922,7 @@ def run():
 
 
 # ============================================================
-# 18. Program entry point
+# 19. Program entry point
 # ============================================================
 
 run()
