@@ -1,16 +1,10 @@
-# pd_control_udp.py
-# PAI-Car v1.0 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
+# main.py
+# PAI-Car line tracing
+# Stage 2: execution structure refactoring only
 #
-# 이 파일은 실제 실행되는 main 파일이다.
-#
-# 학생들이 보는 핵심 흐름:
-#   1. PAI-Car 준비
-#   2. 라인센서 셀프 캘리브레이션
-#   3. 버튼을 눌렀다가 떼면 출발
-#   4. 라인센서 값을 읽는다.
-#   5. PD 제어로 좌우 모터 속도를 계산한다.
-#   6. 20ms마다 주행 데이터를 PC로 보낸다.
-#   7. Finish T 마커를 만나면 정지한다.
+# This version preserves the existing support-function call signatures.
+# The control law remains a simple P controller so that architecture can be
+# changed without simultaneously changing vehicle behavior.
 
 from time import ticks_ms
 
@@ -19,163 +13,162 @@ from modules.pai_car_run_support import (
     setup_paicar,
     self_calibrate_or_stop,
     wait_button_start,
+    read_line,
     limit_cmd,
     wait_control_period,
 )
 
-from modules.pai_udp_telemetry import (
-    PAIUdpTelemetry,
-    read_line_detail,
-    is_t_marker_area,
-)
+
+# ------------------------------------------------------------
+# 1. User parameters
+# ------------------------------------------------------------
+# Replace these two values with the values used by the current stable main.py.
+BASE_SPEED = 350
+KP = 0.20
+
+# Behavior when the line is not detected.
+# Keep this equal to the current stable implementation during Stage 2.
+LINE_LOST_LEFT_CMD = 0
+LINE_LOST_RIGHT_CMD = 0
 
 
 # ------------------------------------------------------------
-# PD-control settings
+# 2. Constants and states
 # ------------------------------------------------------------
-# 학생들이 우선 조정해 볼 값은 아래 세 가지이다.
-
-BASE_SPEED = 1000
-
-
-# KP:
-#   현재 error에 대한 보정 강도이다.
-#   값이 클수록 라인에서 벗어났을 때 더 강하게 방향을 수정한다.
-KP = 0.55
-
-
-# KD:
-#   error 변화량에 대한 보정 강도이다.
-#   값이 적절하면 좌우 흔들림을 줄이고 코너에서 움직임을 부드럽게 만든다.
-KD = 0.22
+STATE_TRACKING = 0
+STATE_LINE_LOST = 1
 
 
 # ------------------------------------------------------------
-# Setup
+# 3. Helper functions defined in main.py
 # ------------------------------------------------------------
-lap_timer = create_lap_timer()
+def calculate_p_commands(error):
+    """
+    Calculate motor commands using the existing P-control behavior.
 
-line, motors, button = setup_paicar(lap_timer)
+    Positive correction increases the left motor command and decreases
+    the right motor command.
+    """
+    correction = KP * error
 
-telemetry = PAIUdpTelemetry(lap_timer)
-telemetry.begin()
+    left_cmd = BASE_SPEED + correction
+    right_cmd = BASE_SPEED - correction
 
-
-# ------------------------------------------------------------
-# Self calibration
-# ------------------------------------------------------------
-self_calibrate_or_stop(line, motors, lap_timer)
-
-
-# ------------------------------------------------------------
-# Button start
-# ------------------------------------------------------------
-wait_button_start(button, lap_timer)
-
-lap_timer.start()
-telemetry.reset_timer()
+    return limit_cmd(left_cmd), limit_cmd(right_cmd)
 
 
-# ------------------------------------------------------------
-# PD-control line tracing
-# ------------------------------------------------------------
-finished = False
-last_error = 0
-left_cmd = 0
-right_cmd = 0
-d_error = 0
+def calculate_line_lost_commands():
+    """
+    Preserve the current line-loss behavior during Stage 2.
 
-try:
-    while True:
-        loop_start = ticks_ms()
+    Stage 7 will replace this function with a recovery state machine.
+    """
+    return (
+        limit_cmd(LINE_LOST_LEFT_CMD),
+        limit_cmd(LINE_LOST_RIGHT_CMD),
+    )
 
-        # --------------------------------------------------------
-        # 1. 라인센서 읽기
-        # --------------------------------------------------------
 
-        error, position, norm, on_line = read_line_detail(line)
+def calculate_drive_commands(error, on_line):
+    """
+    Select the current controller without changing library APIs.
+    """
+    if on_line:
+        return STATE_TRACKING, calculate_p_commands(error)
 
-        is_marker = is_t_marker_area(norm, on_line)
+    return STATE_LINE_LOST, calculate_line_lost_commands()
 
-        # --------------------------------------------------------
-        # 2. Finish 확인
-        # --------------------------------------------------------
 
-        if lap_timer.check_finish(norm, on_line):
-            motors.stop()
-            finished = True
+def run():
+    """
+    Initialize the vehicle and execute the deterministic control loop.
+    """
+    lap_timer = None
+    motors = None
 
-            telemetry.send_now(
-                BASE_SPEED,
-                norm,
-                position,
+    try:
+        # ----------------------------------------------------
+        # 4. Hardware setup
+        # ----------------------------------------------------
+        lap_timer = create_lap_timer()
+        line, motors, button = setup_paicar(lap_timer)
+
+        # ----------------------------------------------------
+        # 5. Calibration and start wait
+        # ----------------------------------------------------
+        self_calibrate_or_stop(line, motors, lap_timer)
+        wait_button_start(button, lap_timer)
+
+        # ----------------------------------------------------
+        # 6. Controller state initialization
+        # ----------------------------------------------------
+        drive_state = STATE_TRACKING
+        lap_timer.start()
+
+        # ----------------------------------------------------
+        # 7. Deterministic control loop
+        # ----------------------------------------------------
+        while True:
+            loop_start = ticks_ms()
+
+            # Sensor input
+            error, on_line, norm = read_line(line)
+
+            # Finish detection uses the same sensor sample.
+            if lap_timer.check_finish(norm, on_line):
+                motors.stop()
+                break
+
+            # Current P-control behavior
+            drive_state, commands = calculate_drive_commands(
                 error,
-                0,
-                0,
-                0,
                 on_line,
-                is_marker
             )
 
-            break
+            left_cmd, right_cmd = commands
 
-        # --------------------------------------------------------
-        # 3. PD 제어
-        # --------------------------------------------------------
-
-        if on_line:
-            d_error = error - last_error
-            correction = int(KP * error + KD * d_error)
-
-            last_error = error
-
-            left_cmd = limit_cmd(BASE_SPEED + correction)
-            right_cmd = limit_cmd(BASE_SPEED - correction)
-
+            # Final motor output
             motors.drive(left_cmd, right_cmd)
 
-        else:
+            # Low-frequency OLED update
+            lap_timer.update()
+
+            # Keep the existing control-period function call
+            wait_control_period(loop_start)
+
+    except KeyboardInterrupt:
+        pass
+
+    except Exception as exc:
+        # Show the error when possible, but do not hide it.
+        if lap_timer is not None:
+            try:
+                lap_timer.show(
+                    "ERROR",
+                    exc.__class__.__name__[:16],
+                    "Motor stopped",
+                    "",
+                )
+            except Exception:
+                pass
+
+        raise
+
+    finally:
+        # ----------------------------------------------------
+        # 8. Guaranteed motor stop
+        # ----------------------------------------------------
+        if motors is not None:
             motors.stop()
 
-            d_error = 0
-            left_cmd = 0
-            right_cmd = 0
-            last_error = 0
-
-        # --------------------------------------------------------
-        # 4. 주행 데이터 전송
-        # --------------------------------------------------------
-        # 실제 전송 주기, packet format, Wi-Fi/UDP 처리는
-        # pai_udp_telemetry.py 안에서 관리한다.
-
-        telemetry.send_if_due(
-            BASE_SPEED,
-            norm,
-            position,
-            error,
-            d_error,
-            left_cmd,
-            right_cmd,
-            on_line,
-            is_marker
-        )
-
-        # --------------------------------------------------------
-        # 5. OLED 갱신
-        # --------------------------------------------------------
-
-        lap_timer.update()
-
-        # --------------------------------------------------------
-        # 6. 제어 주기 맞추기
-        # --------------------------------------------------------
-
-        wait_control_period(loop_start)
+        if lap_timer is not None:
+            try:
+                lap_timer.show_stopped()
+            except Exception:
+                pass
 
 
-finally:
-    motors.stop()
-    telemetry.close()
-
-    if not finished:
-        lap_timer.show_stopped()
+# ------------------------------------------------------------
+# 9. Program entry point
+# ------------------------------------------------------------
+run()
