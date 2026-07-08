@@ -6,7 +6,7 @@
 #   2. packet을 unpack해서 CSV 파일로 저장한다.
 #   3. 하나의 figure에 3개의 subplot을 표시한다.
 #
-# subplot 구성:
+# subplot 구성: a
 #   1) position
 #   2) error
 #   3) left/right motor command
