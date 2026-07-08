@@ -67,9 +67,9 @@ OVERRUN_THRESHOLD_MS = CONTROL_PERIOD_MS
 # ============================================================
 
 # 코스 대부분이 곡선이므로 최고속보다 안정적인 평균속도를 우선한다.
-MAX_TRACK_SPEED = 480
-MEDIUM_CURVE_SPEED = 380
-SHARP_CURVE_SPEED = 270
+MAX_TRACK_SPEED = 540
+MEDIUM_CURVE_SPEED = 420
+SHARP_CURVE_SPEED = 280
 VERY_SHARP_SPEED = 220
 LOW_CONFIDENCE_SPEED = 230
 
