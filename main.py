@@ -232,11 +232,15 @@ left_scale, right_scale = motor_calibrate(
 if lap_timer:
     lap_timer.show_hold(
         "RACE READY",
+        "L:{:.2f} R:{:.2f}".format(
+            left_scale,
+            right_scale
+        ),
         "Press Button",
-        "to START!",
-        ""
+        "to START!"
     )
 
+wait_button_start(button, lap_timer)
 wait_button_start(button, lap_timer)
 
 lap_timer.start()
