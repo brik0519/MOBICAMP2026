@@ -1,15 +1,9 @@
 # main.py
-# PAI-Car high-speed simplified PD controller
-# - aggressive speed mode
-# - single KP / KD tuning
-# - error-based speed control
-# - straight boost up to 1000
-# - hard corner mode for right-angle / sharp corners
-# - late U-turn mode
-# - U-turn capture / reacquire verification
-# - U-turn exit stabilization
-# - simple motor mixer
-# - short strong line-loss recovery
+# PAI-Car high-speed controller
+# - FAST mode for early/mid straight sections
+# - HARD_CORNER mode for sharp corners
+# - LATE_SAFE mode for final U-turn and following gentle curves
+# - UTURN forced rotation/capture removed
 # - UDP telemetry/debug compatible
 
 from time import ticks_ms, ticks_diff
@@ -48,7 +42,7 @@ CONTROL_MS = 10
 
 
 # ------------------------------------------------------------
-# Speed
+# FAST speed
 # ------------------------------------------------------------
 
 BASE_SPEED = 850
@@ -91,7 +85,7 @@ STRAIGHT_DAMP_GAIN_2 = 0.75
 
 
 # ------------------------------------------------------------
-# Hard corner mode
+# HARD_CORNER mode
 # ------------------------------------------------------------
 
 HARD_CORNER_MIN_SPEED = 620
@@ -102,81 +96,34 @@ HARD_CORNER_HARD_ERROR = 1900
 
 HARD_CORNER_HOLD_MS = 260
 
+# 기존보다 약간 완화.
 HARD_CORNER_SPEED = 460
-HARD_CORNER_STEERING_LIMIT = 740
-HARD_CORNER_INNER_FLOOR = 60
-HARD_CORNER_OUTER_BOOST = 900
+HARD_CORNER_STEERING_LIMIT = 720
+HARD_CORNER_INNER_FLOOR = 80
+HARD_CORNER_OUTER_BOOST = 850
 
 
 # ------------------------------------------------------------
-# U-turn mode
+# LATE_SAFE mode
 # ------------------------------------------------------------
 
-# 마지막 U턴 구간 전까지 UTURN 모드 금지.
-UTURN_ENABLE_AFTER_MS = 36000
+# 후반 U턴 및 U턴 이후 완만한 코너 전체를 안정 구간으로 처리.
+# 강제 U턴 회전 모드는 사용하지 않는다.
+LATE_SAFE_AFTER_MS = 36000
 
-UTURN_MIN_SPEED = 650
+LATE_MAX_SPEED = 620
+LATE_BASE_SPEED = 540
+LATE_SLOW_SPEED = 480
+LATE_HARD_SPEED = 400
 
-# 후반부에서는 U턴을 더 빨리 잡도록 낮춘다.
-UTURN_ENTRY_ERROR = 1100
-UTURN_ENTRY_D = 110
+LATE_SLOW_ERROR = 650
+LATE_HARD_ERROR = 1300
 
-UTURN_ENTRY_ERROR_STRONG = 1400
-UTURN_ENTRY_D_STRONG = 140
+LATE_STEERING_LIMIT = 620
+LATE_INNER_FLOOR = 100
 
-UTURN_HARD_ERROR = 1900
-UTURN_EDGE_SUM = 1100
-
-UTURN_HOLD_MS = 360
-
-UTURN_SPEED = 340
-UTURN_STEERING_LIMIT = 900
-UTURN_INNER_FLOOR = 0
-UTURN_OUTER_BOOST = 1000
-
-
-# ------------------------------------------------------------
-# U-turn prep
-# ------------------------------------------------------------
-
-# U턴 직전 사전 감속.
-UTURN_PREP_ERROR = 650
-UTURN_PREP_D = 130
-UTURN_PREP_MIN_SPEED = 750
-
-UTURN_PREP_HOLD_MS = 180
-UTURN_PREP_SPEED = 500
-UTURN_PREP_STEERING_LIMIT = 700
-UTURN_PREP_INNER_FLOOR = 80
-UTURN_PREP_OUTER_BOOST = 900
-
-
-# ------------------------------------------------------------
-# U-turn capture / reacquire verification
-# ------------------------------------------------------------
-
-# U턴 중 또는 직후 라인을 잃은 뒤, 아무 라인이나 잡고 역주행하는 것을 방지.
-UTURN_CAPTURE_HOLD_MS = 900
-UTURN_CAPTURE_SPEED = 260
-UTURN_CAPTURE_STEERING_LIMIT = 620
-UTURN_CAPTURE_INNER_FLOOR = 0
-
-UTURN_LOST_TURN = 900
-
-REACQUIRE_ERROR_BAND = 550
-REACQUIRE_D_BAND = 120
-REACQUIRE_CONFIRM_COUNT = 3
-
-
-# ------------------------------------------------------------
-# U-turn exit stabilization
-# ------------------------------------------------------------
-
-UTURN_EXIT_HOLD_MS = 500
-UTURN_EXIT_SPEED = 430
-UTURN_EXIT_STEERING_LIMIT = 650
-UTURN_EXIT_INNER_FLOOR = 120
-UTURN_EXIT_OUTER_BOOST = None
+# 후반부에서는 boost/outer boost 금지.
+LATE_OUTER_BOOST = None
 
 
 # ------------------------------------------------------------
@@ -200,6 +147,11 @@ INNER_FLOOR = 120
 LOST_FORWARD = 250
 LOST_TURN = 900
 LOST_PIVOT_AFTER_MS = 120
+
+# 후반부는 강제 피벗을 약화한다.
+LATE_LOST_FORWARD = 220
+LATE_LOST_TURN = 650
+LATE_LOST_PIVOT_AFTER_MS = 180
 
 
 # ------------------------------------------------------------
@@ -315,34 +267,12 @@ def count_active_sensors(norm):
     )
 
 
-def edge_sensor_sums(norm):
-    left_edge = norm[0] + norm[1]
-    right_edge = norm[6] + norm[7]
-
-    return (
-        left_edge,
-        right_edge,
-    )
-
-
 def mode_name(
-    in_uturn_capture,
-    in_uturn_exit,
-    in_uturn,
-    in_uturn_prep,
+    in_late_safe,
     in_hard_corner,
 ):
-    if in_uturn_capture:
-        return "UCAP"
-
-    if in_uturn_exit:
-        return "UEXIT"
-
-    if in_uturn:
-        return "UTURN"
-
-    if in_uturn_prep:
-        return "UPREP"
+    if in_late_safe:
+        return "LATE"
 
     if in_hard_corner:
         return "HARD"
@@ -425,6 +355,30 @@ def calculate_target_speed(
         target,
         MIN_SPEED,
         MAX_SPEED,
+    )
+
+
+def calculate_late_safe_speed(
+    filtered_error,
+    filtered_d,
+):
+    abs_error = abs(
+        filtered_error
+    )
+
+    if abs_error >= LATE_HARD_ERROR:
+        target = LATE_HARD_SPEED
+
+    elif abs_error >= LATE_SLOW_ERROR:
+        target = LATE_SLOW_SPEED
+
+    else:
+        target = LATE_BASE_SPEED
+
+    return clamp(
+        target,
+        LATE_HARD_SPEED,
+        LATE_MAX_SPEED,
     )
 
 
@@ -558,94 +512,6 @@ def detect_hard_corner_entry(
     return False
 
 
-def detect_uturn_prep(
-    filtered_error,
-    filtered_d,
-    current_speed,
-):
-    if current_speed < UTURN_PREP_MIN_SPEED:
-        return False
-
-    if not moving_away_from_line(
-        filtered_error,
-        filtered_d,
-    ):
-        return False
-
-    if (
-        abs(filtered_error) >= UTURN_PREP_ERROR
-        and abs(filtered_d) >= UTURN_PREP_D
-    ):
-        return True
-
-    return False
-
-
-def detect_uturn_entry(
-    filtered_error,
-    filtered_d,
-    current_speed,
-    norm,
-):
-    if current_speed < UTURN_MIN_SPEED:
-        return False
-
-    abs_error = abs(
-        filtered_error
-    )
-
-    abs_d = abs(
-        filtered_d
-    )
-
-    (
-        left_edge,
-        right_edge,
-    ) = edge_sensor_sums(
-        norm
-    )
-
-    edge_strong = (
-        left_edge >= UTURN_EDGE_SUM
-        or right_edge >= UTURN_EDGE_SUM
-    )
-
-    moving_away = moving_away_from_line(
-        filtered_error,
-        filtered_d,
-    )
-
-    if abs_error >= UTURN_HARD_ERROR:
-        return True
-
-    if (
-        abs_error >= UTURN_ENTRY_ERROR
-        and abs_d >= UTURN_ENTRY_D
-        and moving_away
-        and edge_strong
-    ):
-        return True
-
-    if (
-        abs_error >= UTURN_ENTRY_ERROR_STRONG
-        and abs_d >= UTURN_ENTRY_D_STRONG
-        and moving_away
-    ):
-        return True
-
-    return False
-
-
-def is_stable_reacquire(
-    filtered_error,
-    filtered_d,
-):
-    return (
-        abs(filtered_error) < REACQUIRE_ERROR_BAND
-        and abs(filtered_d) < REACQUIRE_D_BAND
-    )
-
-
 # ============================================================
 # Motor / recovery
 # ============================================================
@@ -724,40 +590,37 @@ def mix_motor(
 def calculate_recovery_drive(
     last_error,
     lost_elapsed_ms,
+    in_late_safe,
 ):
-    if lost_elapsed_ms < LOST_PIVOT_AFTER_MS:
+    if in_late_safe:
+        forward = LATE_LOST_FORWARD
+        turn = LATE_LOST_TURN
+        pivot_after = LATE_LOST_PIVOT_AFTER_MS
+    else:
+        forward = LOST_FORWARD
+        turn = LOST_TURN
+        pivot_after = LOST_PIVOT_AFTER_MS
+
+    if lost_elapsed_ms < pivot_after:
         if last_error < 0:
             return (
-                LOST_FORWARD,
-                LOST_TURN,
+                forward,
+                turn,
             )
 
         return (
-            LOST_TURN,
-            LOST_FORWARD,
+            turn,
+            forward,
         )
 
     if last_error < 0:
         return (
             0,
-            LOST_TURN,
+            turn,
         )
 
     return (
-        LOST_TURN,
-        0,
-    )
-
-
-def calculate_uturn_capture_drive(uturn_dir):
-    if uturn_dir < 0:
-        return (
-            0,
-            UTURN_LOST_TURN,
-        )
-
-    return (
-        UTURN_LOST_TURN,
+        turn,
         0,
     )
 
@@ -848,8 +711,6 @@ def send_debug_report(
     right_cmd,
     on_line,
     mode,
-    uturn_detection_enabled,
-    reacquire_count,
 ):
     if debug_socket is None:
         return (
@@ -876,9 +737,7 @@ def send_debug_report(
         "left={},"
         "right={},"
         "on_line={},"
-        "mode={},"
-        "uturn_enabled={},"
-        "reacquire={}"
+        "mode={}"
     ).format(
         loop_count,
         target_speed,
@@ -898,8 +757,6 @@ def send_debug_report(
         right_cmd,
         1 if on_line else 0,
         mode,
-        1 if uturn_detection_enabled else 0,
-        reacquire_count,
     )
 
     return send_debug_message(
@@ -917,9 +774,7 @@ def send_final_report(
     total_compute_ms,
     line_lost_count,
     hard_corner_entry_count,
-    uturn_prep_count,
-    uturn_entry_count,
-    uturn_capture_count,
+    late_safe_entered,
     telemetry_sent_count,
     telemetry_skip_count,
     debug_skip_count,
@@ -946,7 +801,7 @@ def send_final_report(
     message = (
         "type=final,"
         "finished={},"
-        "mode=HIGH_SPEED_CAPTURE,"
+        "mode=HIGH_SPEED_LATE_SAFE,"
         "control_ms={},"
         "loops={},"
         "average_compute_ms={:.3f},"
@@ -955,9 +810,7 @@ def send_final_report(
         "overrun_rate={:.2f},"
         "line_lost_entry={},"
         "hard_entry={},"
-        "uturn_prep={},"
-        "uturn_entry={},"
-        "uturn_capture={},"
+        "late_safe={},"
         "telemetry_sent={},"
         "telemetry_skip={},"
         "debug_skip={},"
@@ -972,9 +825,7 @@ def send_final_report(
         overrun_rate,
         line_lost_count,
         hard_corner_entry_count,
-        uturn_prep_count,
-        uturn_entry_count,
-        uturn_capture_count,
+        1 if late_safe_entered else 0,
         telemetry_sent_count,
         telemetry_skip_count,
         debug_skip_count,
@@ -994,10 +845,10 @@ def send_final_report(
 def show_running_mode(lap_timer):
     try:
         lap_timer.show(
-            "HIGH CAPTURE",
+            "HIGH LATE SAFE",
             "BASE {}".format(BASE_SPEED),
             "MAX {}".format(MAX_SPEED),
-            "U after {}".format(UTURN_ENABLE_AFTER_MS),
+            "LATE {}".format(LATE_SAFE_AFTER_MS),
         )
     except Exception:
         pass
@@ -1025,9 +876,7 @@ def run():
 
     line_lost_count = 0
     hard_corner_entry_count = 0
-    uturn_prep_count = 0
-    uturn_entry_count = 0
-    uturn_capture_count = 0
+    late_safe_entered = False
 
     telemetry_sent_count = 0
     telemetry_skip_count = 0
@@ -1087,16 +936,15 @@ def run():
                 (
                     "type=boot,"
                     "telemetry_ok={},"
-                    "mode=HIGH_SPEED_CAPTURE,"
+                    "mode=HIGH_SPEED_LATE_SAFE,"
                     "control_ms={},"
                     "base_speed={},"
                     "max_speed={},"
                     "kp={:.3f},"
                     "kd={:.3f},"
-                    "uturn_after={},"
-                    "uturn_speed={},"
-                    "capture_speed={},"
-                    "exit_speed={}"
+                    "late_after={},"
+                    "late_base={},"
+                    "late_max={}"
                 ).format(
                     telemetry_ok,
                     CONTROL_MS,
@@ -1104,10 +952,9 @@ def run():
                     MAX_SPEED,
                     KP,
                     KD,
-                    UTURN_ENABLE_AFTER_MS,
-                    UTURN_SPEED,
-                    UTURN_CAPTURE_SPEED,
-                    UTURN_EXIT_SPEED,
+                    LATE_SAFE_AFTER_MS,
+                    LATE_BASE_SPEED,
+                    LATE_MAX_SPEED,
                 ),
             )
 
@@ -1161,13 +1008,6 @@ def run():
         previous_on_line = True
 
         hard_corner_until_ms = 0
-        uturn_prep_until_ms = 0
-        uturn_until_ms = 0
-        uturn_capture_until_ms = 0
-        uturn_exit_until_ms = 0
-
-        uturn_dir = 1
-        reacquire_count = 0
 
         last_debug_report_ms = ticks_ms()
 
@@ -1216,41 +1056,12 @@ def run():
                 run_start_ms,
             )
 
-            uturn_detection_enabled = (
-                elapsed_run_ms >= UTURN_ENABLE_AFTER_MS
+            in_late_safe = (
+                elapsed_run_ms >= LATE_SAFE_AFTER_MS
             )
 
-            in_uturn_capture = (
-                ticks_diff(
-                    uturn_capture_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            in_uturn_exit = (
-                ticks_diff(
-                    uturn_exit_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            in_uturn = (
-                ticks_diff(
-                    uturn_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            in_uturn_prep = (
-                ticks_diff(
-                    uturn_prep_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
+            if in_late_safe:
+                late_safe_entered = True
 
             in_hard_corner = (
                 ticks_diff(
@@ -1260,184 +1071,11 @@ def run():
                 > 0
             )
 
-            # UTURN_CAPTURE 중에는 on_line=True라도 즉시 정상 추종하지 않는다.
-            if in_uturn_capture:
-                if (
-                    on_line
-                    and is_stable_reacquire(
-                        filtered_error,
-                        filtered_d,
-                    )
-                ):
-                    reacquire_count += 1
-                else:
-                    reacquire_count = 0
-
-                if reacquire_count >= REACQUIRE_CONFIRM_COUNT:
-                    uturn_capture_until_ms = 0
-                    uturn_exit_until_ms = (
-                        now_ms
-                        + UTURN_EXIT_HOLD_MS
-                    )
-
-                    reacquire_count = 0
-
-                    in_uturn_capture = False
-                    in_uturn_exit = True
-
-                else:
-                    target_speed = UTURN_CAPTURE_SPEED
-                    current_speed = UTURN_CAPTURE_SPEED
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = calculate_uturn_capture_drive(
-                        uturn_dir
-                    )
-
-                    steering = 0
-
-                    motors.drive(
-                        left_cmd,
-                        right_cmd,
-                    )
-
-                    previous_on_line = on_line
-
-                    compute_mid = ticks_ms()
-
-                    compute_before_network_ms = ticks_diff(
-                        compute_mid,
-                        loop_start,
-                    )
-
-                    if telemetry is not None:
-                        now = ticks_ms()
-
-                        if compute_before_network_ms >= TELEMETRY_SKIP_COMPUTE_MS:
-                            telemetry_skip_count += 1
-
-                        elif ticks_diff(
-                            now,
-                            network_cooldown_until_ms,
-                        ) < 0:
-                            telemetry_skip_count += 1
-
-                        else:
-                            send_start = ticks_ms()
-
-                            try:
-                                ok = telemetry.send_if_due(
-                                    current_speed,
-                                    norm,
-                                    position,
-                                    error,
-                                    int(filtered_d),
-                                    left_cmd,
-                                    right_cmd,
-                                    on_line,
-                                    is_marker,
-                                )
-
-                                if ok:
-                                    telemetry_sent_count += 1
-
-                            except Exception:
-                                telemetry_skip_count += 1
-                                ok = False
-
-                            send_cost_ms = ticks_diff(
-                                ticks_ms(),
-                                send_start,
-                            )
-
-                            if send_cost_ms > MAX_NETWORK_SEND_COST_MS:
-                                network_slow_count += 1
-                                network_cooldown_until_ms = (
-                                    ticks_ms()
-                                    + NETWORK_COOLDOWN_MS
-                                )
-
-                    lap_timer.update()
-
-                    compute_end = ticks_ms()
-
-                    last_loop_ms = ticks_diff(
-                        compute_end,
-                        loop_start,
-                    )
-
-                    total_compute_ms += last_loop_ms
-
-                    if last_loop_ms > max_loop_ms:
-                        max_loop_ms = last_loop_ms
-
-                    if last_loop_ms >= OVERRUN_THRESHOLD_MS:
-                        overrun_count += 1
-
-                    if DEBUG_MODE:
-                        now = ticks_ms()
-
-                        debug_elapsed_ms = ticks_diff(
-                            now,
-                            last_debug_report_ms,
-                        )
-
-                        if debug_elapsed_ms >= DEBUG_REPORT_MS:
-                            current_mode = mode_name(
-                                True,
-                                False,
-                                False,
-                                False,
-                                False,
-                            )
-
-                            (
-                                ok,
-                                cost_ms,
-                            ) = send_debug_report(
-                                debug_socket,
-                                loop_count,
-                                overrun_count,
-                                max_loop_ms,
-                                last_loop_ms,
-                                target_speed,
-                                current_speed,
-                                error,
-                                filtered_error,
-                                filtered_d,
-                                confidence,
-                                active_count,
-                                steering,
-                                left_cmd,
-                                right_cmd,
-                                on_line,
-                                current_mode,
-                                uturn_detection_enabled,
-                                reacquire_count,
-                            )
-
-                            if cost_ms > MAX_NETWORK_SEND_COST_MS:
-                                network_slow_count += 1
-                                network_cooldown_until_ms = (
-                                    ticks_ms()
-                                    + NETWORK_COOLDOWN_MS
-                                )
-
-                            last_debug_report_ms = now
-
-                    wait_control_period(
-                        loop_start
-                    )
-
-                    continue
-
-            # HARD_CORNER는 초중반 급코너용.
+            # HARD_CORNER는 LATE_SAFE 이전에만 강하게 사용한다.
+            # 후반부에서는 LATE_SAFE가 전체를 담당한다.
             if (
                 on_line
-                and not in_uturn
-                and not in_uturn_exit
+                and not in_late_safe
                 and detect_hard_corner_entry(
                     filtered_error,
                     filtered_d,
@@ -1455,82 +1093,6 @@ def run():
                     + HARD_CORNER_HOLD_MS
                 )
 
-            # UTURN_PREP / UTURN은 후반에서만 허용.
-            if uturn_detection_enabled:
-                if (
-                    on_line
-                    and detect_uturn_prep(
-                        filtered_error,
-                        filtered_d,
-                        current_speed,
-                    )
-                ):
-                    if ticks_diff(
-                        uturn_prep_until_ms,
-                        now_ms,
-                    ) <= 0:
-                        uturn_prep_count += 1
-
-                    uturn_prep_until_ms = (
-                        now_ms
-                        + UTURN_PREP_HOLD_MS
-                    )
-
-                    if filtered_error < 0:
-                        uturn_dir = -1
-                    else:
-                        uturn_dir = 1
-
-                if (
-                    on_line
-                    and detect_uturn_entry(
-                        filtered_error,
-                        filtered_d,
-                        current_speed,
-                        norm,
-                    )
-                ):
-                    if ticks_diff(
-                        uturn_until_ms,
-                        now_ms,
-                    ) <= 0:
-                        uturn_entry_count += 1
-
-                    uturn_until_ms = (
-                        now_ms
-                        + UTURN_HOLD_MS
-                    )
-
-                    # U턴 진입 방향 저장.
-                    if filtered_error < 0:
-                        uturn_dir = -1
-                    else:
-                        uturn_dir = 1
-
-            in_uturn_exit = (
-                ticks_diff(
-                    uturn_exit_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            in_uturn = (
-                ticks_diff(
-                    uturn_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            in_uturn_prep = (
-                ticks_diff(
-                    uturn_prep_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
             in_hard_corner = (
                 ticks_diff(
                     hard_corner_until_ms,
@@ -1538,24 +1100,6 @@ def run():
                 )
                 > 0
             )
-
-            # U턴 중 line lost가 발생하면 capture 모드로 들어간다.
-            if (
-                previous_on_line
-                and not on_line
-                and (
-                    in_uturn
-                    or in_uturn_prep
-                    or in_uturn_exit
-                )
-            ):
-                uturn_capture_until_ms = (
-                    now_ms
-                    + UTURN_CAPTURE_HOLD_MS
-                )
-
-                uturn_capture_count += 1
-                reacquire_count = 0
 
             if elapsed_run_ms >= MIN_FINISH_MS:
                 if lap_timer.check_finish(
@@ -1618,18 +1162,14 @@ def run():
                         "error={},"
                         "filtered_error={:.1f},"
                         "hard_entry={},"
-                        "uturn_prep={},"
-                        "uturn_entry={},"
-                        "uturn_capture={}"
+                        "late_safe={}"
                     ).format(
                         loop_count,
                         current_speed,
                         error,
                         filtered_error,
                         hard_corner_entry_count,
-                        uturn_prep_count,
-                        uturn_entry_count,
-                        uturn_capture_count,
+                        1 if late_safe_entered else 0,
                     ),
                 )
 
@@ -1642,14 +1182,21 @@ def run():
                 last_valid_error = filtered_error
                 lost_start_ms = None
 
-                if in_uturn:
-                    target_speed = UTURN_SPEED
-                    current_speed = UTURN_SPEED
+                if in_late_safe:
+                    target_speed = calculate_late_safe_speed(
+                        filtered_error,
+                        filtered_d,
+                    )
+
+                    current_speed = move_speed(
+                        current_speed,
+                        target_speed,
+                    )
 
                     steering = calculate_steering(
                         filtered_error,
                         filtered_d,
-                        UTURN_STEERING_LIMIT,
+                        LATE_STEERING_LIMIT,
                         allow_straight_damping=False,
                     )
 
@@ -1659,50 +1206,8 @@ def run():
                     ) = mix_motor(
                         current_speed,
                         steering,
-                        UTURN_INNER_FLOOR,
-                        outer_boost=UTURN_OUTER_BOOST,
-                    )
-
-                elif in_uturn_exit:
-                    target_speed = UTURN_EXIT_SPEED
-                    current_speed = UTURN_EXIT_SPEED
-
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        UTURN_EXIT_STEERING_LIMIT,
-                        allow_straight_damping=False,
-                    )
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        UTURN_EXIT_INNER_FLOOR,
-                        outer_boost=UTURN_EXIT_OUTER_BOOST,
-                    )
-
-                elif in_uturn_prep:
-                    target_speed = UTURN_PREP_SPEED
-                    current_speed = UTURN_PREP_SPEED
-
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        UTURN_PREP_STEERING_LIMIT,
-                        allow_straight_damping=False,
-                    )
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        UTURN_PREP_INNER_FLOOR,
-                        outer_boost=UTURN_PREP_OUTER_BOOST,
+                        LATE_INNER_FLOOR,
+                        outer_boost=LATE_OUTER_BOOST,
                     )
 
                 elif in_hard_corner:
@@ -1772,38 +1277,23 @@ def run():
                     lost_start_ms,
                 )
 
-                if (
-                    in_uturn
-                    or in_uturn_prep
-                    or in_uturn_exit
-                    or ticks_diff(
-                        uturn_capture_until_ms,
-                        now_ms,
-                    ) > 0
-                ):
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = calculate_uturn_capture_drive(
-                        uturn_dir
-                    )
+                (
+                    left_cmd,
+                    right_cmd,
+                ) = calculate_recovery_drive(
+                    last_valid_error,
+                    lost_elapsed_ms,
+                    in_late_safe,
+                )
 
-                    target_speed = UTURN_CAPTURE_SPEED
-                    current_speed = UTURN_CAPTURE_SPEED
-                    steering = 0
-
+                if in_late_safe:
+                    target_speed = LATE_LOST_FORWARD
+                    current_speed = LATE_LOST_FORWARD
                 else:
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = calculate_recovery_drive(
-                        last_valid_error,
-                        lost_elapsed_ms,
-                    )
-
                     target_speed = LOST_FORWARD
                     current_speed = LOST_FORWARD
-                    steering = 0
+
+                steering = 0
 
                 motors.drive(
                     left_cmd,
@@ -1905,13 +1395,7 @@ def run():
 
                     else:
                         current_mode = mode_name(
-                            ticks_diff(
-                                uturn_capture_until_ms,
-                                now_ms,
-                            ) > 0,
-                            in_uturn_exit,
-                            in_uturn,
-                            in_uturn_prep,
+                            in_late_safe,
                             in_hard_corner,
                         )
 
@@ -1936,8 +1420,6 @@ def run():
                             right_cmd,
                             on_line,
                             current_mode,
-                            uturn_detection_enabled,
-                            reacquire_count,
                         )
 
                         if cost_ms > MAX_NETWORK_SEND_COST_MS:
@@ -2018,9 +1500,7 @@ def run():
             total_compute_ms,
             line_lost_count,
             hard_corner_entry_count,
-            uturn_prep_count,
-            uturn_entry_count,
-            uturn_capture_count,
+            late_safe_entered,
             telemetry_sent_count,
             telemetry_skip_count,
             debug_skip_count,
