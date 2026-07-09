@@ -1,22 +1,20 @@
-# pd_control_udp.py
+# main.py
 # PAI-Car v1.0 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
 #
-# 랩타임 단축 조합 1단계:
-#   - 조건부 역회전 허용 유지
-#   - KP = 0.52, KD = 0.21 유지
-#   - MAX_CORRECTION = 1100 유지
-#   - CURVE_SPEED = 800 유지
-#   - SHARP_CURVE_SPEED = 650 유지
-#   - 커브 구간에서도 encoder boost를 +30까지만 허용
-#   - 시작선 / 종료선 오검출 방지 유지
+# 무엔코더 안정 버전 1단계:
+#   - 엔코더 없는 모터 기준
+#   - encoder speed feedback 제거
+#   - distance_ticks 기반 slow zone 제거
+#   - error / d_error 기반 속도 제어 유지
+#   - 라인 미검출 시 마지막 error 방향 저속 탐색 추가
+#   - UDP 확장 포맷은 유지하되 encoder 관련 값은 0으로 전송
 #
-# 아직 추가하지 않은 것:
-#   - 라인 미검출 시 마지막 오차 방향 저속 탐색
-#   - UDP packet에 encoder 값 추가
+# 현재 목표:
+#   1. 48.1초대 완주 안정성 유지
+#   2. 40~42초 부근 급커브 라인 미검출 복구
+#   3. 이후 시간 기반 slow zone을 제한적으로 적용
 
 from time import ticks_ms, ticks_diff
-
-from modules.pai_encoder import WheelEncoders
 
 from modules.pai_car_run_support import (
     CONTROL_MS,
@@ -46,41 +44,46 @@ MAX_CORRECTION = 1100
 
 
 # ------------------------------------------------------------
-# Encoder-based speed settings
+# Speed settings
 # ------------------------------------------------------------
 
 STRAIGHT_SPEED = 1000
 
-CURVE_SPEED = 800
-SHARP_CURVE_SPEED = 650
+# 기존 encoder boost +30이 사실상 고정으로 들어가던 상태를 반영한다.
+# 기존: CURVE 800 + boost 30 = 830
+# 기존: SHARP 650 + boost 30 = 680
+CURVE_SPEED = 830
+SHARP_CURVE_SPEED = 680
 
 MIN_RUN_SPEED = 500
 
 
 # ------------------------------------------------------------
-# Encoder speed feedback settings
+# Optional time-based slow zones
+# ------------------------------------------------------------
+#
+# 엔코더가 없으므로 distance 기반 slow zone은 사용할 수 없다.
+# 대신 elapsed_ms 기준 slow zone을 제한적으로 사용할 수 있다.
+#
+# 주의:
+#   시간 기반 slow zone은 랩타임이 바뀌면 위치가 밀린다.
+#   따라서 처음에는 비활성으로 둔다.
+#
+# 40~42초 부근에서 계속 라인을 잃으면 아래 예시를 활성화한다.
+#
+# TIME_SLOW_ZONES = [
+#     (40000, 42000, 650),
+# ]
+
+TIME_SLOW_ZONES = []
+
+
+# ------------------------------------------------------------
+# Line-loss recovery settings
 # ------------------------------------------------------------
 
-REF_PWM = 900
-REF_TICK_SPEED = 80
-
-SPEED_KP = 1
-MAX_SPEED_BOOST = 60
-
-# 커브 구간에서 허용할 양수 speed boost 상한
-# 0이면 안정 조합, 30이면 랩타임 단축 1단계
-CURVE_POSITIVE_BOOST_LIMIT = 30
-
-
-# ------------------------------------------------------------
-# Distance-based slow zones
-# ------------------------------------------------------------
-
-SLOW_ZONES = [
-    # (120, 180, 720),
-    # (360, 430, 650),
-    # (590, 660, 620),
-]
+SEARCH_PWM = 280
+LINE_LOSS_MAX_MS = 250
 
 
 # ------------------------------------------------------------
@@ -94,7 +97,6 @@ MARKER_CONFIRM_COUNT = 3
 MARKER_RELEASE_COUNT = 5
 
 MIN_FINISH_MS = 3000
-MIN_FINISH_DISTANCE_TICKS = 0
 
 DEBUG_MARKER = False
 
@@ -165,11 +167,11 @@ def marker_detected_now(norm, on_line):
     return on_line and (black_count >= T_MARKER_MIN_COUNT)
 
 
-def speed_from_distance(distance_ticks):
+def speed_from_time(elapsed_ms):
     speed = STRAIGHT_SPEED
 
-    for start_tick, end_tick, zone_speed in SLOW_ZONES:
-        if start_tick <= distance_ticks <= end_tick:
+    for start_ms, end_ms, zone_speed in TIME_SLOW_ZONES:
+        if start_ms <= elapsed_ms <= end_ms:
             if zone_speed < speed:
                 speed = zone_speed
 
@@ -192,30 +194,6 @@ def speed_from_error(base_speed, error, d_error):
         speed = MIN_RUN_SPEED
 
     return speed
-
-
-def target_tick_speed_from_pwm(target_pwm):
-    if REF_PWM <= 0:
-        return REF_TICK_SPEED
-
-    return target_pwm * REF_TICK_SPEED // REF_PWM
-
-
-def encoder_speed_boost(encoders, target_pwm):
-    actual_tick_speed = encoders.progress_speed
-
-    target_tick_speed = target_tick_speed_from_pwm(target_pwm)
-
-    speed_error = target_tick_speed - actual_tick_speed
-    boost = SPEED_KP * speed_error
-
-    boost = clamp_value(
-        boost,
-        -MAX_SPEED_BOOST,
-        MAX_SPEED_BOOST
-    )
-
-    return boost
 
 
 def marker_event_from_norm(norm, on_line):
@@ -257,8 +235,6 @@ lap_timer = create_lap_timer()
 
 line, motors, button = setup_paicar(lap_timer)
 
-encoders = WheelEncoders(left_pin=16, right_pin=17)
-
 telemetry = PAIUdpTelemetry(lap_timer)
 telemetry.begin()
 
@@ -278,7 +254,6 @@ wait_button_start(button, lap_timer)
 
 lap_timer.start()
 telemetry.reset_timer()
-encoders.reset()
 
 run_start_ms = ticks_ms()
 
@@ -298,6 +273,8 @@ was_on_line = False
 
 target_speed = BASE_SPEED
 
+line_lost_start_ms = None
+
 last_udp_loop_ms = 0
 last_udp_send_cost_ms = 0
 last_udp_overrun = 0
@@ -310,12 +287,9 @@ marker_release_count = 0
 try:
     while True:
         loop_start = ticks_ms()
+        now_ms = ticks_ms()
 
-        # --------------------------------------------------------
-        # 0. 엔코더 상태 업데이트
-        # --------------------------------------------------------
-
-        encoders.update()
+        elapsed_ms = ticks_diff(now_ms, run_start_ms)
 
         # --------------------------------------------------------
         # 1. 라인센서 읽기
@@ -334,7 +308,6 @@ try:
         if marker_event:
             marker_count += 1
 
-            elapsed_ms = ticks_diff(ticks_ms(), run_start_ms)
             black_count = count_black_sensors(norm)
 
             if DEBUG_MARKER:
@@ -343,8 +316,6 @@ try:
                     marker_count,
                     "t=",
                     elapsed_ms,
-                    "dist=",
-                    encoders.distance_ticks,
                     "black=",
                     black_count
                 )
@@ -358,17 +329,12 @@ try:
                 if elapsed_ms < MIN_FINISH_MS:
                     finish_allowed = False
 
-                if encoders.distance_ticks < MIN_FINISH_DISTANCE_TICKS:
-                    finish_allowed = False
-
-
                 if finish_allowed:
                     d_error = 0
                     left_cmd = 0
                     right_cmd = 0
                     target_speed = 0
 
-                    encoders.set_direction_from_cmd(0, 0)
                     motors.stop()
                     finished = True
 
@@ -377,18 +343,18 @@ try:
                         norm,
                         position,
                         error,
-                        0,
-                        0,
-                        0,
+                        d_error,
+                        left_cmd,
+                        right_cmd,
                         on_line,
                         is_marker,
 
-                        encoders.distance_ticks,
-                        encoders.left_speed,
-                        encoders.right_speed,
-                        encoders.dl,
-                        encoders.dr,
-                        encoders.heading_ticks,
+                        0,  # distance_ticks
+                        0,  # left_speed
+                        0,  # right_speed
+                        0,  # dl
+                        0,  # dr
+                        0,  # heading_ticks
 
                         last_udp_loop_ms,
                         last_udp_send_cost_ms,
@@ -404,16 +370,16 @@ try:
                         print(
                             "EARLY_MARKER_IGNORED",
                             "t=",
-                            elapsed_ms,
-                            "dist=",
-                            encoders.distance_ticks
+                            elapsed_ms
                         )
 
         # --------------------------------------------------------
-        # 3. PD 제어 + 엔코더 기반 속도 보정
+        # 3. PD 제어 + 라인 미검출 복구
         # --------------------------------------------------------
 
         if on_line:
+            line_lost_start_ms = None
+
             if was_on_line:
                 d_error = error - last_error
             else:
@@ -422,34 +388,13 @@ try:
             last_error = error
             was_on_line = True
 
-            distance_speed = speed_from_distance(
-                encoders.distance_ticks
-            )
+            time_speed = speed_from_time(elapsed_ms)
 
-            safe_speed = speed_from_error(
-                distance_speed,
+            target_speed = speed_from_error(
+                time_speed,
                 error,
                 d_error
             )
-
-            speed_boost = encoder_speed_boost(
-                encoders,
-                safe_speed
-            )
-
-            # 랩타임 단축 1단계:
-            # 커브 감속 상태에서도 양수 boost를 +30까지만 허용한다.
-            if safe_speed < STRAIGHT_SPEED:
-                if speed_boost > CURVE_POSITIVE_BOOST_LIMIT:
-                    speed_boost = CURVE_POSITIVE_BOOST_LIMIT
-
-            target_speed = safe_speed + speed_boost
-
-            if target_speed > STRAIGHT_SPEED:
-                target_speed = STRAIGHT_SPEED
-
-            if target_speed < MIN_RUN_SPEED:
-                target_speed = MIN_RUN_SPEED
 
             correction = int(KP * error + KD * d_error)
             correction = clamp_correction(correction)
@@ -464,18 +409,37 @@ try:
                 error
             )
 
-            encoders.set_direction_from_cmd(left_cmd, right_cmd)
             motors.drive(left_cmd, right_cmd)
 
         else:
-            encoders.set_direction_from_cmd(0, 0)
-            motors.stop()
+            now = ticks_ms()
+
+            if line_lost_start_ms is None:
+                line_lost_start_ms = now
+
+            loss_ms = ticks_diff(now, line_lost_start_ms)
 
             d_error = 0
-            left_cmd = 0
-            right_cmd = 0
             target_speed = 0
             was_on_line = False
+
+            # 마지막으로 보았던 error 방향으로 저속 제자리 탐색한다.
+            # error < 0 상태에서 라인을 잃었다면 왼쪽으로 치우친 것으로 보고
+            # 왼쪽 바퀴 후진, 오른쪽 바퀴 전진으로 회전한다.
+            if loss_ms <= LINE_LOSS_MAX_MS:
+                if last_error < 0:
+                    left_cmd = -SEARCH_PWM
+                    right_cmd = SEARCH_PWM
+                else:
+                    left_cmd = SEARCH_PWM
+                    right_cmd = -SEARCH_PWM
+
+                motors.drive(left_cmd, right_cmd)
+
+            else:
+                left_cmd = 0
+                right_cmd = 0
+                motors.stop()
 
         # --------------------------------------------------------
         # 4. 주행 데이터 전송
@@ -492,12 +456,12 @@ try:
             on_line,
             is_marker,
 
-            encoders.distance_ticks,
-            encoders.left_speed,
-            encoders.right_speed,
-            encoders.dl,
-            encoders.dr,
-            encoders.heading_ticks,
+            0,  # distance_ticks
+            0,  # left_speed
+            0,  # right_speed
+            0,  # dl
+            0,  # dr
+            0,  # heading_ticks
 
             last_udp_loop_ms,
             last_udp_send_cost_ms,
@@ -529,7 +493,6 @@ try:
 
 
 finally:
-    encoders.set_direction_from_cmd(0, 0)
     motors.stop()
     telemetry.close()
 
