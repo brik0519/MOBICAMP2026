@@ -1,26 +1,13 @@
 # modules/pai_udp_command.py
-# PAI-Car Step 3 Pico 2 W UDP command receiver
-#
-# 역할:
-#   PC dashboard에서 보낸 UDP command packet을 non-blocking으로 수신한다.
-#   3단계에서는 PING / STOP / SAFE_MODE / RUN만 처리한다.
-#
-# 주의:
-#   이 파일의 packet format은 PC 쪽 dashboard/command_sender.py와 반드시 같아야 한다.
-#   주행 루프를 막으면 안 되므로 recvfrom은 non-blocking으로만 사용한다.
-#   주행 중 flash 저장은 하지 않는다.
+# PAI-Car Pico 2 W UDP command receiver
 
 import socket
 import struct
 import time
 
 
-# ------------------------------------------------------------
-# UDP command protocol VERSION 1
-# ------------------------------------------------------------
-
-COMMAND_MAGIC = 0x5043     # PC -> Pico command
-ACK_MAGIC = 0x4341         # Pico -> PC ack
+COMMAND_MAGIC = 0x5043
+ACK_MAGIC = 0x4341
 VERSION = 1
 
 COMMAND_FORMAT = "<HBBHBBhi"
@@ -30,27 +17,16 @@ ACK_FORMAT = "<HBBHBB"
 ACK_SIZE = struct.calcsize(ACK_FORMAT)
 
 
-# ------------------------------------------------------------
-# Command port
-# ------------------------------------------------------------
-
 COMMAND_LISTEN_IP = "0.0.0.0"
 COMMAND_PORT = 5006
 
 
-# ------------------------------------------------------------
-# Command types
-# ------------------------------------------------------------
-
 CMD_PING = 1
 CMD_STOP = 2
-CMD_SAFE_MODE = 3
+CMD_SAFE_MODE = 3      # kept for compatibility
 CMD_RUN = 4
+CMD_NEXT_SECTION = 5
 
-
-# ------------------------------------------------------------
-# Status codes
-# ------------------------------------------------------------
 
 STATUS_OK = 0
 STATUS_BAD_MAGIC = 1
@@ -60,13 +36,8 @@ STATUS_UNKNOWN_CMD = 4
 STATUS_ERROR = 5
 
 
-# ------------------------------------------------------------
-# Run states
-# ------------------------------------------------------------
-
-RUN_STATE_RUN = 1
 RUN_STATE_STOP = 0
-RUN_STATE_SAFE = 2
+RUN_STATE_RUN = 1
 
 
 def ticks_ms():
@@ -88,15 +59,13 @@ class PAIUdpCommand:
         self.listen_ip = listen_ip
         self.listen_port = listen_port
         self.command_timeout_ms = command_timeout_ms
-
-        # 3단계에서는 heartbeat를 강제하지 않는다.
-        # True로 바꾸면 마지막 command 이후 timeout 시 SAFE 상태로 간다.
         self.require_heartbeat = require_heartbeat
 
         self.sock = None
         self.enabled = False
 
         self.run_state = RUN_STATE_RUN
+        self.track_section_id = 0
 
         self.last_cmd_seq = 0
         self.last_cmd_type = 0
@@ -220,21 +189,26 @@ class PAIUdpCommand:
         cmd_type = cmd["cmd_type"]
 
         if cmd_type == CMD_PING:
-            # 상태 변경 없음
             return STATUS_OK
 
         if cmd_type == CMD_STOP:
+            # Z key: emergency stop.
             self.run_state = RUN_STATE_STOP
             return STATUS_OK
 
         if cmd_type == CMD_SAFE_MODE:
-            # 3단계에서는 SAFE_MODE를 안전 정지로 처리한다.
-            # 이후 profile 단계에서 저속 SAFE profile로 확장한다.
-            self.run_state = RUN_STATE_SAFE
+            # Compatibility only. Treat as emergency stop.
+            self.run_state = RUN_STATE_STOP
             return STATUS_OK
 
         if cmd_type == CMD_RUN:
             self.run_state = RUN_STATE_RUN
+            return STATUS_OK
+
+        if cmd_type == CMD_NEXT_SECTION:
+            # Space key: track section marker.
+            # This must not stop the car.
+            self.track_section_id = (self.track_section_id + 1) & 0xFFFF
             return STATUS_OK
 
         return STATUS_UNKNOWN_CMD
@@ -267,13 +241,13 @@ class PAIUdpCommand:
 
         now = ticks_ms()
         if ticks_diff(now, self.last_cmd_ms) > self.command_timeout_ms:
-            self.run_state = RUN_STATE_SAFE
+            self.run_state = RUN_STATE_STOP
             return True
 
         return False
 
     def should_force_stop(self):
-        return self.run_state == RUN_STATE_STOP or self.run_state == RUN_STATE_SAFE
+        return self.run_state == RUN_STATE_STOP
 
     def is_running(self):
         return self.run_state == RUN_STATE_RUN
@@ -281,11 +255,11 @@ class PAIUdpCommand:
     def is_stopped(self):
         return self.run_state == RUN_STATE_STOP
 
-    def is_safe(self):
-        return self.run_state == RUN_STATE_SAFE
-
     def get_run_state(self):
         return self.run_state
+
+    def get_track_section_id(self):
+        return self.track_section_id
 
     def get_last_cmd_seq(self):
         return self.last_cmd_seq
@@ -295,10 +269,11 @@ class PAIUdpCommand:
 
     def debug_text(self):
         return (
-            "udp_cmd state={} recv={} bad={} ack={} "
+            "udp_cmd state={} section={} recv={} bad={} ack={} "
             "last_seq={} last_type={} last_status={} error={}"
         ).format(
             self.run_state,
+            self.track_section_id,
             self.recv_count,
             self.bad_count,
             self.ack_count,

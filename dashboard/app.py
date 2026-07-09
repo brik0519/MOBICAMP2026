@@ -41,7 +41,7 @@ from command_sender import (
     CommandSender,
     CMD_PING,
     CMD_STOP,
-    CMD_SAFE_MODE,
+    CMD_NEXT_SECTION,
     CMD_RUN,
 )
 
@@ -381,11 +381,11 @@ class Dashboard(QtWidgets.QMainWindow):
             return
 
         if key == KEY_SPACE:
-            self.send_command(CMD_STOP)
+            self.send_command(CMD_NEXT_SECTION)
             return
 
         if key == KEY_Z:
-            self.send_command(CMD_SAFE_MODE)
+            self.send_command(CMD_STOP)
             return
 
         if key == KEY_RETURN or key == KEY_ENTER:
@@ -410,7 +410,7 @@ class Dashboard(QtWidgets.QMainWindow):
                 "left={left_cmd}  right={right_cmd}  on_line={on_line}  marker={is_marker}"
             ).format(**self.last_row)
 
-        command_help = "keys: P=PING  Space=STOP  Z=SAFE_MODE  Enter=RUN"
+        command_help = "keys: P=PING  Space=NEXT_SECTION  Z=EMERGENCY_STOP  Enter=RUN"
 
         self.status_label.setText(
             "telemetry_listen={}:{}  packet_size={}  version={}  "

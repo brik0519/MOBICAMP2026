@@ -1,72 +1,37 @@
 # command_sender.py
-# PAI-Car Step 3 PC -> Pico UDP command sender
-#
-# 역할:
-#   PC dashboard에서 Pico 2 W로 command packet을 전송한다.
-#   3단계에서는 PING / STOP / SAFE_MODE / RUN만 지원한다.
-#
-# 주의:
-#   이 파일의 packet format은 Pico 쪽 modules/pai_udp_command.py와 반드시 같아야 한다.
+# PAI-Car PC -> Pico UDP command sender
 
 import socket
 import struct
 import time
 
 
-# ------------------------------------------------------------
-# UDP command protocol VERSION 1
-# ------------------------------------------------------------
-
-COMMAND_MAGIC = 0x5043     # "PC" 의미로 사용
-ACK_MAGIC = 0x4341         # "CA" 의미로 사용
+COMMAND_MAGIC = 0x5043
+ACK_MAGIC = 0x4341
 VERSION = 1
 
-# Command packet:
-#   magic          uint16
-#   version        uint8
-#   packet_size    uint8
-#   cmd_seq        uint16
-#   cmd_type       uint8
-#   target_id      uint8
-#   param_id       int16
-#   value          int32
-#
-# 현재 3단계에서는 target_id, param_id, value는 거의 사용하지 않는다.
 COMMAND_FORMAT = "<HBBHBBhi"
 COMMAND_SIZE = struct.calcsize(COMMAND_FORMAT)
 
-# ACK packet:
-#   magic          uint16
-#   version        uint8
-#   packet_size    uint8
-#   cmd_seq        uint16
-#   cmd_type       uint8
-#   status         uint8
 ACK_FORMAT = "<HBBHBB"
 ACK_SIZE = struct.calcsize(ACK_FORMAT)
 
 
-# ------------------------------------------------------------
-# Command types
-# ------------------------------------------------------------
-
 CMD_PING = 1
 CMD_STOP = 2
-CMD_SAFE_MODE = 3
+CMD_SAFE_MODE = 3      # kept for compatibility
 CMD_RUN = 4
+CMD_NEXT_SECTION = 5
 
 
 CMD_NAMES = {
     CMD_PING: "PING",
-    CMD_STOP: "STOP",
+    CMD_STOP: "EMERGENCY_STOP",
     CMD_SAFE_MODE: "SAFE_MODE",
     CMD_RUN: "RUN",
+    CMD_NEXT_SECTION: "NEXT_SECTION",
 }
 
-
-# ------------------------------------------------------------
-# Status codes
-# ------------------------------------------------------------
 
 STATUS_OK = 0
 STATUS_BAD_MAGIC = 1
@@ -278,7 +243,10 @@ class CommandSender:
         return acks
 
     def stats_text(self):
-        target = "{}:{}".format(self.target_ip, self.target_port) if self.target_ip else "unknown:{}".format(self.target_port)
+        if self.target_ip:
+            target = "{}:{}".format(self.target_ip, self.target_port)
+        else:
+            target = "unknown:{}".format(self.target_port)
 
         if self.last_sent is None:
             last_sent = "none"
