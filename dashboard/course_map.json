@@ -13,9 +13,9 @@
   ],
 
   "course_name": "mobi_race_track_2026",
-  "version": 2,
+  "version": 3,
   "section_index_mode": "manual_next_by_space",
-  "description": "Known official race track map. Space key advances to the next section.",
+  "description": "Known official race track map. Hairpin approach and hairpin are merged into one HAIRPIN_U section.",
   "track_size": {
     "width_m": 1.2,
     "height_m": 5.0
@@ -111,26 +111,16 @@
     {
       "section_id": 6,
       "display_no": 7,
-      "name": "hairpin_approach",
-      "label_ko": "헤어핀 진입 준비구간",
+      "name": "hairpin_entry_and_u",
+      "label_ko": "헤어핀 진입+헤어핀",
       "type": "HAIRPIN_U",
       "profile_key": "HAIRPIN_U",
-      "role": "HAIRPIN_APPROACH",
-      "note": "좁은 S자 직후 헤어핀 전 짧은 공간. 헤어핀 진입 전에 미리 감속하기 위한 구간."
+      "role": "NORMAL",
+      "note": "좁은 S자 직후 헤어핀 전 짧은 공간부터 실제 헤어핀까지 하나의 HAIRPIN_U profile로 처리한다."
     },
     {
       "section_id": 7,
       "display_no": 8,
-      "name": "hairpin_u_1",
-      "label_ko": "헤어핀",
-      "type": "HAIRPIN_U",
-      "profile_key": "HAIRPIN_U",
-      "role": "NORMAL",
-      "note": "큰 감속과 강한 조향 필요."
-    },
-    {
-      "section_id": 8,
-      "display_no": 9,
       "name": "middle_straight",
       "label_ko": "중간 직진구간",
       "type": "STRAIGHT",
@@ -139,8 +129,8 @@
       "note": "헤어핀 탈출 후 자세가 안정되면 가속."
     },
     {
-      "section_id": 9,
-      "display_no": 10,
+      "section_id": 8,
+      "display_no": 9,
       "name": "wide_u_1",
       "label_ko": "완만한 U턴",
       "type": "WIDE_U",
@@ -149,8 +139,8 @@
       "note": "진입 감속 필요."
     },
     {
-      "section_id": 10,
-      "display_no": 11,
+      "section_id": 9,
+      "display_no": 10,
       "name": "short_straight_2",
       "label_ko": "짧은 직진",
       "type": "STRAIGHT",
@@ -159,8 +149,8 @@
       "note": "다음 좁은 S자 진입 전 과속 주의."
     },
     {
-      "section_id": 11,
-      "display_no": 12,
+      "section_id": 10,
+      "display_no": 11,
       "name": "half_narrow_s",
       "label_ko": "좁은 S자 절반",
       "type": "NARROW_S",
@@ -169,8 +159,8 @@
       "note": "짧지만 라인 이탈 위험이 있음."
     },
     {
-      "section_id": 12,
-      "display_no": 13,
+      "section_id": 11,
+      "display_no": 12,
       "name": "finish_short_straight",
       "label_ko": "Finish 전 짧은 직진",
       "type": "STRAIGHT",

@@ -149,7 +149,6 @@ PROFILES = {
     },
 }
 
-
 # ------------------------------------------------------------
 # Course section sequence
 # ------------------------------------------------------------
@@ -212,24 +211,15 @@ COURSE_SECTIONS = [
     {
         "section_id": 6,
         "display_no": 7,
-        "name": "hairpin_approach",
-        "label_ko": "헤어핀 진입 준비구간",
-        "type": "HAIRPIN_U",
-        "profile_key": "HAIRPIN_U",
-        "role": "HAIRPIN_APPROACH",
-    },
-    {
-        "section_id": 7,
-        "display_no": 8,
-        "name": "hairpin_u_1",
-        "label_ko": "헤어핀",
+        "name": "hairpin_entry_and_u",
+        "label_ko": "헤어핀 진입+헤어핀",
         "type": "HAIRPIN_U",
         "profile_key": "HAIRPIN_U",
         "role": "NORMAL",
     },
     {
-        "section_id": 8,
-        "display_no": 9,
+        "section_id": 7,
+        "display_no": 8,
         "name": "middle_straight",
         "label_ko": "중간 직진구간",
         "type": "STRAIGHT",
@@ -237,8 +227,8 @@ COURSE_SECTIONS = [
         "role": "NORMAL",
     },
     {
-        "section_id": 9,
-        "display_no": 10,
+        "section_id": 8,
+        "display_no": 9,
         "name": "wide_u_1",
         "label_ko": "완만한 U턴",
         "type": "WIDE_U",
@@ -246,8 +236,8 @@ COURSE_SECTIONS = [
         "role": "NORMAL",
     },
     {
-        "section_id": 10,
-        "display_no": 11,
+        "section_id": 9,
+        "display_no": 10,
         "name": "short_straight_2",
         "label_ko": "짧은 직진",
         "type": "STRAIGHT",
@@ -255,8 +245,8 @@ COURSE_SECTIONS = [
         "role": "NORMAL",
     },
     {
-        "section_id": 11,
-        "display_no": 12,
+        "section_id": 10,
+        "display_no": 11,
         "name": "half_narrow_s",
         "label_ko": "좁은 S자 절반",
         "type": "NARROW_S",
@@ -264,8 +254,8 @@ COURSE_SECTIONS = [
         "role": "NORMAL",
     },
     {
-        "section_id": 12,
-        "display_no": 13,
+        "section_id": 11,
+        "display_no": 12,
         "name": "finish_short_straight",
         "label_ko": "Finish 전 짧은 직진",
         "type": "STRAIGHT",
