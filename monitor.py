@@ -50,7 +50,7 @@ RECV_BUFFER_SIZE = 2048
 MAGIC = 0x5041
 VERSION = 1
 
-PACKET_FORMAT = "<HBBHIHHh8HHhhhhBB"
+PACKET_FORMAT = "<HBBHIHHh8HHhhhhBBihhhhihhBB"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 
 
@@ -64,7 +64,10 @@ CSV_HEADER = [
     "control_ms",
     "send_ms",
     "base_speed",
-    "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7",
+
+    "n0", "n1", "n2", "n3",
+    "n4", "n5", "n6", "n7",
+
     "position",
     "error",
     "d_error",
@@ -72,6 +75,16 @@ CSV_HEADER = [
     "right_cmd",
     "on_line",
     "is_marker",
+
+    "distance_ticks",
+    "left_speed",
+    "right_speed",
+    "dl",
+    "dr",
+    "heading_ticks",
+    "udp_loop_ms",
+    "udp_send_cost_ms",
+    "udp_overrun",
 ]
 
 LOG_DIR = "logs"

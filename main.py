@@ -1,19 +1,25 @@
-# main.py
-# PAI-Car high-speed controller
-# - FAST mode for early/mid straight sections
-# - HARD_CORNER mode for sharp corners
-# - LATE_SAFE mode only for final U-turn window
-# - POST_LATE mode for controlled speed recovery after U-turn
-# - UTURN forced rotation/capture removed
-# - UDP telemetry/debug compatible
+# pd_control_udp.py
+# PAI-Car v1.0 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
+#
+# 랩타임 단축 조합 1단계:
+#   - 조건부 역회전 허용 유지
+#   - KP = 0.52, KD = 0.21 유지
+#   - MAX_CORRECTION = 1100 유지
+#   - CURVE_SPEED = 800 유지
+#   - SHARP_CURVE_SPEED = 650 유지
+#   - 커브 구간에서도 encoder boost를 +30까지만 허용
+#   - 시작선 / 종료선 오검출 방지 유지
+#
+# 아직 추가하지 않은 것:
+#   - 라인 미검출 시 마지막 오차 방향 저속 탐색
+#   - UDP packet에 encoder 값 추가
 
 from time import ticks_ms, ticks_diff
-import socket
 
-import modules.pai_car_run_support as run_support
-import modules.pai_udp_telemetry as udp_telemetry
+from modules.pai_encoder import WheelEncoders
 
 from modules.pai_car_run_support import (
+    CONTROL_MS,
     create_lap_timer,
     setup_paicar,
     self_calibrate_or_stop,
@@ -25,1633 +31,503 @@ from modules.pai_car_run_support import (
 from modules.pai_udp_telemetry import (
     PAIUdpTelemetry,
     read_line_detail,
-    is_t_marker_area,
-)
-
-from modules.pai_car_wifi_config import (
-    PC_IP,
-    PC_PORT,
 )
 
 
-# ============================================================
-# TUNING PANEL
-# ============================================================
+# ------------------------------------------------------------
+# PD-control settings
+# ------------------------------------------------------------
 
-DEBUG_MODE = True
-CONTROL_MS = 10
+BASE_SPEED = 1000
+
+KP = 0.52
+KD = 0.21
+
+MAX_CORRECTION = 1100
 
 
 # ------------------------------------------------------------
-# FAST speed
+# Encoder-based speed settings
 # ------------------------------------------------------------
 
-BASE_SPEED = 850
-MAX_SPEED = 1000
-MIN_SPEED = 420
+STRAIGHT_SPEED = 1000
 
-SLOW_ERROR = 750
-HARD_ERROR = 1500
+CURVE_SPEED = 800
+SHARP_CURVE_SPEED = 650
 
-SLOW_SPEED = 700
-HARD_SPEED = 520
-
-BOOST_ERROR = 220
-BOOST_D_ERROR = 70
-
-SPEED_RISE = 25
-SPEED_FALL = 150
+MIN_RUN_SPEED = 500
 
 
 # ------------------------------------------------------------
-# Steering
+# Encoder speed feedback settings
 # ------------------------------------------------------------
 
-KP = 0.24
-KD = 0.42
+REF_PWM = 900
+REF_TICK_SPEED = 80
 
-STEERING_LIMIT = 620
-ERROR_DEADBAND = 60
+SPEED_KP = 1
+MAX_SPEED_BOOST = 60
 
-ERROR_ALPHA = 0.55
-D_ALPHA = 0.18
-
-STRAIGHT_DAMP_ERROR_1 = 300
-STRAIGHT_DAMP_D_1 = 90
-STRAIGHT_DAMP_GAIN_1 = 0.55
-
-STRAIGHT_DAMP_ERROR_2 = 500
-STRAIGHT_DAMP_D_2 = 140
-STRAIGHT_DAMP_GAIN_2 = 0.75
+# 커브 구간에서 허용할 양수 speed boost 상한
+# 0이면 안정 조합, 30이면 랩타임 단축 1단계
+CURVE_POSITIVE_BOOST_LIMIT = 30
 
 
 # ------------------------------------------------------------
-# HARD_CORNER mode
+# Distance-based slow zones
 # ------------------------------------------------------------
 
-HARD_CORNER_MIN_SPEED = 620
-
-HARD_CORNER_ENTRY_ERROR = 1050
-HARD_CORNER_ENTRY_D = 90
-HARD_CORNER_HARD_ERROR = 1900
-
-HARD_CORNER_HOLD_MS = 260
-
-HARD_CORNER_SPEED = 460
-HARD_CORNER_STEERING_LIMIT = 720
-HARD_CORNER_INNER_FLOOR = 80
-HARD_CORNER_OUTER_BOOST = 850
+SLOW_ZONES = [
+    # (120, 180, 720),
+    # (360, 430, 650),
+    # (590, 660, 620),
+]
 
 
 # ------------------------------------------------------------
-# LATE_SAFE mode
+# Safe start / finish marker settings
 # ------------------------------------------------------------
 
-# U턴 통과용 안정 구간.
-# 이 구간이 끝나면 더 이상 LATE_SAFE에 갇히지 않는다.
-LATE_SAFE_AFTER_MS = 36000
-LATE_SAFE_END_MS = 43500
+T_MARKER_TH = 700
+T_MARKER_MIN_COUNT = 6
 
-LATE_MAX_SPEED = 620
-LATE_BASE_SPEED = 540
-LATE_SLOW_SPEED = 480
-LATE_HARD_SPEED = 400
+MARKER_CONFIRM_COUNT = 3
+MARKER_RELEASE_COUNT = 5
 
-LATE_SLOW_ERROR = 650
-LATE_HARD_ERROR = 1300
+MIN_FINISH_MS = 3000
+MIN_FINISH_DISTANCE_TICKS = 0
 
-LATE_STEERING_LIMIT = 620
-LATE_INNER_FLOOR = 100
-LATE_OUTER_BOOST = None
+DEBUG_MARKER = False
 
 
 # ------------------------------------------------------------
-# POST_LATE mode
+# Helper functions
 # ------------------------------------------------------------
 
-# U턴 이후 긴 직선/완만 코너에서 속도를 복구한다.
-# 바로 1000으로 풀지 않고 43.5~52초 동안 단계적으로 복귀한다.
-POST_LATE_AFTER_MS = LATE_SAFE_END_MS
-POST_LATE_END_MS = 52000
+def clamp_value(value, low, high):
+    if value < low:
+        return low
 
-POST_LATE_BASE_SPEED = 720
-POST_LATE_MAX_SPEED = 900
-
-POST_LATE_SLOW_SPEED = 620
-POST_LATE_HARD_SPEED = 500
-
-POST_LATE_SLOW_ERROR = 750
-POST_LATE_HARD_ERROR = 1500
-
-POST_LATE_BOOST_ERROR = 180
-POST_LATE_BOOST_D_ERROR = 50
-
-POST_LATE_STEERING_LIMIT = 620
-POST_LATE_INNER_FLOOR = 120
-POST_LATE_OUTER_BOOST = None
-
-
-# ------------------------------------------------------------
-# Motor
-# ------------------------------------------------------------
-
-MOTOR_MAX_CMD = 1000
-
-LEFT_GAIN = 1.00
-RIGHT_GAIN = 1.00
-
-ALLOW_REVERSE = False
-
-INNER_FLOOR = 120
-
-
-# ------------------------------------------------------------
-# Line loss recovery
-# ------------------------------------------------------------
-
-LOST_FORWARD = 250
-LOST_TURN = 900
-LOST_PIVOT_AFTER_MS = 120
-
-LATE_LOST_FORWARD = 220
-LATE_LOST_TURN = 650
-LATE_LOST_PIVOT_AFTER_MS = 180
-
-POST_LATE_LOST_FORWARD = 240
-POST_LATE_LOST_TURN = 750
-POST_LATE_LOST_PIVOT_AFTER_MS = 160
-
-
-# ------------------------------------------------------------
-# Finish guard
-# ------------------------------------------------------------
-
-MIN_FINISH_MS = 1500
-FINISH_CONFIRM_COUNT = 2
-
-
-# ------------------------------------------------------------
-# Sensor
-# ------------------------------------------------------------
-
-SENSOR_ACTIVE_THRESHOLD = 300
-SENSOR_SUM_FULL = 4000
-
-
-# ------------------------------------------------------------
-# Debug / telemetry
-# ------------------------------------------------------------
-
-DEBUG_PC_PORT = PC_PORT + 1
-DEBUG_REPORT_MS = 500
-
-OVERRUN_THRESHOLD_MS = CONTROL_MS
-
-MAX_NETWORK_SEND_COST_MS = 2
-NETWORK_COOLDOWN_MS = 120
-
-TELEMETRY_SKIP_COMPUTE_MS = 7
-DEBUG_REPORT_MAX_LAG_MS = 1500
-
-
-run_support.CONTROL_MS = CONTROL_MS
-udp_telemetry.CONTROL_MS = CONTROL_MS
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def clamp(value, minimum, maximum):
-    if value < minimum:
-        return minimum
-
-    if value > maximum:
-        return maximum
+    if value > high:
+        return high
 
     return value
 
 
-def move_speed(current, target):
-    if target > current:
-        return min(
-            current + SPEED_RISE,
-            target,
-        )
+def clamp_correction(value):
+    if value > MAX_CORRECTION:
+        return MAX_CORRECTION
 
-    return max(
-        current - SPEED_FALL,
-        target,
-    )
+    if value < -MAX_CORRECTION:
+        return -MAX_CORRECTION
+
+    return int(value)
 
 
-def read_sensor_data(line):
-    (
-        error,
-        position,
-        norm,
-        on_line,
-    ) = read_line_detail(line)
+def limit_drive_cmd(value, error):
+    """
+    정상 라인트레이싱 중 모터 출력 제한.
 
-    is_marker = is_t_marker_area(
-        norm,
-        on_line,
-    )
+    error가 작을 때는 역회전 금지.
+    error가 클 때만 제한적 역회전 허용.
+    """
 
-    return (
-        error,
-        position,
-        norm,
-        on_line,
-        is_marker,
-    )
+    ae = abs(error)
+
+    if ae >= 2200:
+        min_cmd = -450
+    elif ae >= 1500:
+        min_cmd = -250
+    else:
+        min_cmd = 0
+
+    if value > 1000:
+        return 1000
+
+    if value < min_cmd:
+        return min_cmd
+
+    return int(value)
 
 
-def count_active_sensors(norm):
+def count_black_sensors(norm):
     count = 0
-    total = 0
 
-    for value in norm:
-        total += value
-
-        if value >= SENSOR_ACTIVE_THRESHOLD:
+    for v in norm:
+        if v >= T_MARKER_TH:
             count += 1
 
-    if SENSOR_SUM_FULL > 0:
-        confidence = total / SENSOR_SUM_FULL
-    else:
-        confidence = 0.0
+    return count
 
-    confidence = clamp(
-        confidence,
-        0.0,
-        1.0,
+
+def marker_detected_now(norm, on_line):
+    black_count = count_black_sensors(norm)
+
+    return on_line and (black_count >= T_MARKER_MIN_COUNT)
+
+
+def speed_from_distance(distance_ticks):
+    speed = STRAIGHT_SPEED
+
+    for start_tick, end_tick, zone_speed in SLOW_ZONES:
+        if start_tick <= distance_ticks <= end_tick:
+            if zone_speed < speed:
+                speed = zone_speed
+
+    return speed
+
+
+def speed_from_error(base_speed, error, d_error):
+    ae = abs(error)
+    ad = abs(d_error)
+
+    speed = base_speed
+
+    if ae > 2000 or ad > 1400:
+        speed = min(speed, SHARP_CURVE_SPEED)
+
+    elif ae > 1200 or ad > 800:
+        speed = min(speed, CURVE_SPEED)
+
+    if speed < MIN_RUN_SPEED:
+        speed = MIN_RUN_SPEED
+
+    return speed
+
+
+def target_tick_speed_from_pwm(target_pwm):
+    if REF_PWM <= 0:
+        return REF_TICK_SPEED
+
+    return target_pwm * REF_TICK_SPEED // REF_PWM
+
+
+def encoder_speed_boost(encoders, target_pwm):
+    actual_tick_speed = (
+        encoders.left_speed + encoders.right_speed
+    ) // 2
+
+    target_tick_speed = target_tick_speed_from_pwm(target_pwm)
+
+    speed_error = target_tick_speed - actual_tick_speed
+    boost = SPEED_KP * speed_error
+
+    boost = clamp_value(
+        boost,
+        -MAX_SPEED_BOOST,
+        MAX_SPEED_BOOST
     )
 
-    return (
-        count,
-        total,
-        confidence,
-    )
+    return boost
 
 
-def mode_name(
-    in_late_safe,
-    in_post_late,
-    in_hard_corner,
-):
-    if in_late_safe:
-        return "LATE"
+def marker_event_from_norm(norm, on_line):
+    global marker_active
+    global marker_detect_count
+    global marker_release_count
 
-    if in_post_late:
-        return "POST"
+    detected = marker_detected_now(norm, on_line)
 
-    if in_hard_corner:
-        return "HARD"
+    if detected:
+        marker_release_count = 0
 
-    return "FAST"
+        if marker_detect_count < MARKER_CONFIRM_COUNT:
+            marker_detect_count += 1
 
-
-# ============================================================
-# Filter / speed / steering
-# ============================================================
-
-def update_filters(
-    error,
-    on_line,
-    previous_filtered_error,
-    previous_filtered_d,
-):
-    if on_line:
-        filtered_error = (
-            previous_filtered_error
-            + ERROR_ALPHA
-            * (
-                error
-                - previous_filtered_error
-            )
-        )
-    else:
-        filtered_error = previous_filtered_error
-
-    if on_line:
-        raw_d = (
-            filtered_error
-            - previous_filtered_error
-        ) * (
-            10.0
-            / CONTROL_MS
-        )
-    else:
-        raw_d = 0.0
-
-    filtered_d = (
-        previous_filtered_d
-        + D_ALPHA
-        * (
-            raw_d
-            - previous_filtered_d
-        )
-    )
-
-    return (
-        filtered_error,
-        filtered_d,
-    )
-
-
-def calculate_target_speed(
-    filtered_error,
-    filtered_d,
-):
-    abs_error = abs(
-        filtered_error
-    )
-
-    if abs_error >= HARD_ERROR:
-        target = HARD_SPEED
-
-    elif abs_error >= SLOW_ERROR:
-        target = SLOW_SPEED
+        if marker_detect_count >= MARKER_CONFIRM_COUNT:
+            if not marker_active:
+                marker_active = True
+                return True
 
     else:
-        target = BASE_SPEED
+        marker_detect_count = 0
 
-    if (
-        abs_error < BOOST_ERROR
-        and abs(filtered_d) < BOOST_D_ERROR
-    ):
-        target = MAX_SPEED
+        if marker_active:
+            marker_release_count += 1
 
-    return clamp(
-        target,
-        MIN_SPEED,
-        MAX_SPEED,
-    )
-
-
-def calculate_late_safe_speed(
-    filtered_error,
-    filtered_d,
-):
-    abs_error = abs(
-        filtered_error
-    )
-
-    if abs_error >= LATE_HARD_ERROR:
-        target = LATE_HARD_SPEED
-
-    elif abs_error >= LATE_SLOW_ERROR:
-        target = LATE_SLOW_SPEED
-
-    else:
-        target = LATE_BASE_SPEED
-
-    return clamp(
-        target,
-        LATE_HARD_SPEED,
-        LATE_MAX_SPEED,
-    )
-
-
-def calculate_post_late_speed(
-    filtered_error,
-    filtered_d,
-):
-    abs_error = abs(
-        filtered_error
-    )
-
-    if abs_error >= POST_LATE_HARD_ERROR:
-        target = POST_LATE_HARD_SPEED
-
-    elif abs_error >= POST_LATE_SLOW_ERROR:
-        target = POST_LATE_SLOW_SPEED
-
-    else:
-        target = POST_LATE_BASE_SPEED
-
-    if (
-        abs_error < POST_LATE_BOOST_ERROR
-        and abs(filtered_d) < POST_LATE_BOOST_D_ERROR
-    ):
-        target = POST_LATE_MAX_SPEED
-
-    return clamp(
-        target,
-        POST_LATE_HARD_SPEED,
-        POST_LATE_MAX_SPEED,
-    )
-
-
-def apply_error_deadband(error):
-    if abs(error) <= ERROR_DEADBAND:
-        return 0.0
-
-    if error > 0:
-        return error - ERROR_DEADBAND
-
-    return error + ERROR_DEADBAND
-
-
-def damp_steering_on_straight(
-    steering,
-    filtered_error,
-    filtered_d,
-):
-    abs_error = abs(
-        filtered_error
-    )
-
-    abs_d = abs(
-        filtered_d
-    )
-
-    if (
-        abs_error < STRAIGHT_DAMP_ERROR_1
-        and abs_d < STRAIGHT_DAMP_D_1
-    ):
-        return int(
-            steering
-            * STRAIGHT_DAMP_GAIN_1
-        )
-
-    if (
-        abs_error < STRAIGHT_DAMP_ERROR_2
-        and abs_d < STRAIGHT_DAMP_D_2
-    ):
-        return int(
-            steering
-            * STRAIGHT_DAMP_GAIN_2
-        )
-
-    return int(
-        steering
-    )
-
-
-def calculate_steering(
-    filtered_error,
-    filtered_d,
-    steering_limit,
-    allow_straight_damping=True,
-):
-    control_error = apply_error_deadband(
-        filtered_error
-    )
-
-    steering = (
-        KP
-        * control_error
-        + KD
-        * filtered_d
-    )
-
-    steering = clamp(
-        steering,
-        -steering_limit,
-        steering_limit,
-    )
-
-    if allow_straight_damping:
-        steering = damp_steering_on_straight(
-            steering,
-            filtered_error,
-            filtered_d,
-        )
-
-    return int(
-        steering
-    )
-
-
-# ============================================================
-# Detection
-# ============================================================
-
-def moving_away_from_line(
-    filtered_error,
-    filtered_d,
-):
-    return (
-        filtered_error
-        * filtered_d
-        > 0
-    )
-
-
-def detect_hard_corner_entry(
-    filtered_error,
-    filtered_d,
-    current_speed,
-):
-    if current_speed < HARD_CORNER_MIN_SPEED:
-        return False
-
-    abs_error = abs(
-        filtered_error
-    )
-
-    abs_d = abs(
-        filtered_d
-    )
-
-    moving_away = moving_away_from_line(
-        filtered_error,
-        filtered_d,
-    )
-
-    if abs_error >= HARD_CORNER_HARD_ERROR:
-        return True
-
-    if (
-        abs_error >= HARD_CORNER_ENTRY_ERROR
-        and abs_d >= HARD_CORNER_ENTRY_D
-        and moving_away
-    ):
-        return True
+            if marker_release_count >= MARKER_RELEASE_COUNT:
+                marker_active = False
+                marker_release_count = 0
 
     return False
 
 
-# ============================================================
-# Motor / recovery
-# ============================================================
+# ------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------
 
-def mix_motor(
-    speed,
-    steering,
-    inner_floor,
-    outer_boost=None,
-):
-    left = (
-        speed
-        + steering
-    )
+lap_timer = create_lap_timer()
 
-    right = (
-        speed
-        - steering
-    )
+line, motors, button = setup_paicar(lap_timer)
 
-    left *= LEFT_GAIN
-    right *= RIGHT_GAIN
+encoders = WheelEncoders(left_pin=16, right_pin=17)
 
-    if not ALLOW_REVERSE:
-        if left < 0:
-            left = 0
-
-        if right < 0:
-            right = 0
-
-    if speed > 0:
-        if left <= 0:
-            left = inner_floor
-        elif left < inner_floor:
-            left = inner_floor
-
-        if right <= 0:
-            right = inner_floor
-        elif right < inner_floor:
-            right = inner_floor
-
-    if outer_boost is not None:
-        if steering > 0:
-            left = max(
-                left,
-                outer_boost,
-            )
-        elif steering < 0:
-            right = max(
-                right,
-                outer_boost,
-            )
-
-    left = clamp(
-        left,
-        0,
-        MOTOR_MAX_CMD,
-    )
-
-    right = clamp(
-        right,
-        0,
-        MOTOR_MAX_CMD,
-    )
-
-    return (
-        limit_cmd(
-            int(left)
-        ),
-        limit_cmd(
-            int(right)
-        ),
-    )
+telemetry = PAIUdpTelemetry(lap_timer)
+telemetry.begin()
 
 
-def calculate_recovery_drive(
-    last_error,
-    lost_elapsed_ms,
-    in_late_safe,
-    in_post_late,
-):
-    if in_late_safe:
-        forward = LATE_LOST_FORWARD
-        turn = LATE_LOST_TURN
-        pivot_after = LATE_LOST_PIVOT_AFTER_MS
+# ------------------------------------------------------------
+# Self calibration
+# ------------------------------------------------------------
 
-    elif in_post_late:
-        forward = POST_LATE_LOST_FORWARD
-        turn = POST_LATE_LOST_TURN
-        pivot_after = POST_LATE_LOST_PIVOT_AFTER_MS
-
-    else:
-        forward = LOST_FORWARD
-        turn = LOST_TURN
-        pivot_after = LOST_PIVOT_AFTER_MS
-
-    if lost_elapsed_ms < pivot_after:
-        if last_error < 0:
-            return (
-                forward,
-                turn,
-            )
-
-        return (
-            turn,
-            forward,
-        )
-
-    if last_error < 0:
-        return (
-            0,
-            turn,
-        )
-
-    return (
-        turn,
-        0,
-    )
+self_calibrate_or_stop(line, motors, lap_timer)
 
 
-# ============================================================
-# Debug UDP
-# ============================================================
+# ------------------------------------------------------------
+# Button start
+# ------------------------------------------------------------
 
-def create_debug_socket():
-    if not DEBUG_MODE:
-        return None
+wait_button_start(button, lap_timer)
 
-    try:
-        debug_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_DGRAM,
-        )
+lap_timer.start()
+telemetry.reset_timer()
+encoders.reset()
 
-        try:
-            debug_socket.setblocking(False)
-        except Exception:
-            pass
-
-        return debug_socket
-
-    except OSError:
-        return None
+run_start_ms = ticks_ms()
 
 
-def send_debug_message(
-    debug_socket,
-    message,
-):
-    if debug_socket is None:
-        return (
-            False,
-            0,
-        )
+# ------------------------------------------------------------
+# PD-control line tracing
+# ------------------------------------------------------------
 
-    start_ms = ticks_ms()
+finished = False
 
-    try:
-        debug_socket.sendto(
-            message.encode(),
-            (
-                PC_IP,
-                DEBUG_PC_PORT,
-            ),
-        )
+last_error = 0
+left_cmd = 0
+right_cmd = 0
+d_error = 0
 
-        cost_ms = ticks_diff(
-            ticks_ms(),
-            start_ms,
-        )
+was_on_line = False
 
-        return (
-            True,
-            cost_ms,
-        )
+target_speed = BASE_SPEED
 
-    except OSError:
-        cost_ms = ticks_diff(
-            ticks_ms(),
-            start_ms,
-        )
+last_udp_loop_ms = 0
+last_udp_send_cost_ms = 0
+last_udp_overrun = 0
 
-        return (
-            False,
-            cost_ms,
-        )
+marker_count = 0
+marker_active = False
+marker_detect_count = 0
+marker_release_count = 0
 
+try:
+    while True:
+        loop_start = ticks_ms()
 
-def send_debug_report(
-    debug_socket,
-    loop_count,
-    overrun_count,
-    max_loop_ms,
-    last_loop_ms,
-    target_speed,
-    current_speed,
-    error,
-    filtered_error,
-    filtered_d,
-    confidence,
-    active_count,
-    steering,
-    left_cmd,
-    right_cmd,
-    on_line,
-    mode,
-):
-    if debug_socket is None:
-        return (
-            False,
-            0,
-        )
+        # --------------------------------------------------------
+        # 0. 엔코더 상태 업데이트
+        # --------------------------------------------------------
 
-    message = (
-        "type=status,"
-        "loop={},"
-        "target={},"
-        "current={},"
-        "compute_ms={},"
-        "max_ms={},"
-        "overrun={},"
-        "error={},"
-        "filtered_error={:.1f},"
-        "filtered_rate={:.1f},"
-        "confidence={:.2f},"
-        "active={},"
-        "kp={:.3f},"
-        "kd={:.3f},"
-        "steering={},"
-        "left={},"
-        "right={},"
-        "on_line={},"
-        "mode={}"
-    ).format(
-        loop_count,
-        target_speed,
-        current_speed,
-        last_loop_ms,
-        max_loop_ms,
-        overrun_count,
-        error,
-        filtered_error,
-        filtered_d,
-        confidence,
-        active_count,
-        KP,
-        KD,
-        steering,
-        left_cmd,
-        right_cmd,
-        1 if on_line else 0,
-        mode,
-    )
+        encoders.update()
 
-    return send_debug_message(
-        debug_socket,
-        message,
-    )
+        # --------------------------------------------------------
+        # 1. 라인센서 읽기
+        # --------------------------------------------------------
 
+        error, position, norm, on_line = read_line_detail(line)
 
-def send_final_report(
-    debug_socket,
-    finished,
-    loop_count,
-    overrun_count,
-    max_loop_ms,
-    total_compute_ms,
-    line_lost_count,
-    hard_corner_entry_count,
-    late_safe_entered,
-    post_late_entered,
-    telemetry_sent_count,
-    telemetry_skip_count,
-    debug_skip_count,
-    network_slow_count,
-):
-    if debug_socket is None:
-        return
+        is_marker = marker_detected_now(norm, on_line)
 
-    if loop_count > 0:
-        average_compute_ms = (
-            total_compute_ms
-            / loop_count
-        )
+        # --------------------------------------------------------
+        # 2. Start / Finish marker 확인
+        # --------------------------------------------------------
 
-        overrun_rate = (
-            overrun_count
-            * 100.0
-            / loop_count
-        )
-    else:
-        average_compute_ms = 0.0
-        overrun_rate = 0.0
+        marker_event = marker_event_from_norm(norm, on_line)
 
-    message = (
-        "type=final,"
-        "finished={},"
-        "mode=HIGH_SPEED_LATE_POST,"
-        "control_ms={},"
-        "loops={},"
-        "average_compute_ms={:.3f},"
-        "max_compute_ms={},"
-        "overrun_count={},"
-        "overrun_rate={:.2f},"
-        "line_lost_entry={},"
-        "hard_entry={},"
-        "late_safe={},"
-        "post_late={},"
-        "telemetry_sent={},"
-        "telemetry_skip={},"
-        "debug_skip={},"
-        "network_slow={}"
-    ).format(
-        finished,
-        CONTROL_MS,
-        loop_count,
-        average_compute_ms,
-        max_loop_ms,
-        overrun_count,
-        overrun_rate,
-        line_lost_count,
-        hard_corner_entry_count,
-        1 if late_safe_entered else 0,
-        1 if post_late_entered else 0,
-        telemetry_sent_count,
-        telemetry_skip_count,
-        debug_skip_count,
-        network_slow_count,
-    )
+        if marker_event:
+            marker_count += 1
 
-    send_debug_message(
-        debug_socket,
-        message,
-    )
+            elapsed_ms = ticks_diff(ticks_ms(), run_start_ms)
+            black_count = count_black_sensors(norm)
 
+            if DEBUG_MARKER:
+                print(
+                    "MARKER",
+                    marker_count,
+                    "t=",
+                    elapsed_ms,
+                    "dist=",
+                    encoders.distance_ticks,
+                    "black=",
+                    black_count
+                )
 
-# ============================================================
-# OLED
-# ============================================================
+            if marker_count == 1:
+                pass
 
-def show_running_mode(lap_timer):
-    try:
-        lap_timer.show(
-            "LATE POST",
-            "L {}-{}".format(
-                LATE_SAFE_AFTER_MS,
-                LATE_SAFE_END_MS,
-            ),
-            "P {}-{}".format(
-                POST_LATE_AFTER_MS,
-                POST_LATE_END_MS,
-            ),
-            "MAX {}".format(MAX_SPEED),
-        )
-    except Exception:
-        pass
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def run():
-    lap_timer = None
-    motors = None
-
-    telemetry = None
-    debug_socket = None
-
-    finished = False
-
-    loop_count = 0
-    overrun_count = 0
-
-    max_loop_ms = 0
-    total_compute_ms = 0
-    last_loop_ms = 0
-
-    line_lost_count = 0
-    hard_corner_entry_count = 0
-    late_safe_entered = False
-    post_late_entered = False
-
-    telemetry_sent_count = 0
-    telemetry_skip_count = 0
-    debug_skip_count = 0
-    network_slow_count = 0
-
-    network_cooldown_until_ms = 0
-
-    try:
-        lap_timer = create_lap_timer()
-
-        (
-            line,
-            motors,
-            button,
-        ) = setup_paicar(
-            lap_timer
-        )
-
-        if DEBUG_MODE:
-            telemetry_ok = False
-
-            telemetry = PAIUdpTelemetry(
-                lap_timer
-            )
-
-            telemetry_ok = telemetry.begin()
-
-            if telemetry_ok:
-                try:
-                    if telemetry.sock is not None:
-                        telemetry.sock.setblocking(
-                            False
-                        )
-                except Exception:
-                    pass
             else:
-                telemetry = None
+                finish_allowed = True
 
-                try:
-                    lap_timer.show(
-                        "UDP FAILED",
-                        "WiFi/IP check",
-                        "No telemetry",
-                        "",
-                    )
-                except Exception:
-                    pass
+                if elapsed_ms < MIN_FINISH_MS:
+                    finish_allowed = False
 
-            debug_socket = create_debug_socket()
+                if encoders.distance_ticks < MIN_FINISH_DISTANCE_TICKS:
+                    finish_allowed = False
 
-            (
-                ok,
-                cost_ms,
-            ) = send_debug_message(
-                debug_socket,
-                (
-                    "type=boot,"
-                    "telemetry_ok={},"
-                    "mode=HIGH_SPEED_LATE_POST,"
-                    "control_ms={},"
-                    "base_speed={},"
-                    "max_speed={},"
-                    "kp={:.3f},"
-                    "kd={:.3f},"
-                    "late_after={},"
-                    "late_end={},"
-                    "post_end={}"
-                ).format(
-                    telemetry_ok,
-                    CONTROL_MS,
-                    BASE_SPEED,
-                    MAX_SPEED,
-                    KP,
-                    KD,
-                    LATE_SAFE_AFTER_MS,
-                    LATE_SAFE_END_MS,
-                    POST_LATE_END_MS,
-                ),
-            )
+                if finish_allowed:
+                    motors.stop()
+                    finished = True
 
-            if cost_ms > MAX_NETWORK_SEND_COST_MS:
-                network_slow_count += 1
-                network_cooldown_until_ms = (
-                    ticks_ms()
-                    + NETWORK_COOLDOWN_MS
-                )
-
-        self_calibrate_or_stop(
-            line,
-            motors,
-            lap_timer,
-        )
-
-        show_running_mode(
-            lap_timer
-        )
-
-        wait_button_start(
-            button,
-            lap_timer,
-        )
-
-        lap_timer.start()
-
-        run_start_ms = ticks_ms()
-
-        if telemetry is not None:
-            telemetry.reset_timer()
-
-        send_debug_message(
-            debug_socket,
-            "type=start",
-        )
-
-        previous_filtered_error = 0.0
-        previous_filtered_d = 0.0
-
-        current_speed = MIN_SPEED
-        target_speed = BASE_SPEED
-
-        steering = 0
-
-        left_cmd = 0
-        right_cmd = 0
-
-        last_valid_error = 0.0
-        lost_start_ms = None
-        previous_on_line = True
-
-        hard_corner_until_ms = 0
-
-        last_debug_report_ms = ticks_ms()
-
-        finish_confirm_count = 0
-
-        while True:
-            loop_start = ticks_ms()
-
-            loop_count += 1
-
-            (
-                error,
-                position,
-                norm,
-                on_line,
-                is_marker,
-            ) = read_sensor_data(
-                line
-            )
-
-            (
-                active_count,
-                sensor_sum,
-                confidence,
-            ) = count_active_sensors(
-                norm
-            )
-
-            (
-                filtered_error,
-                filtered_d,
-            ) = update_filters(
-                error,
-                on_line,
-                previous_filtered_error,
-                previous_filtered_d,
-            )
-
-            previous_filtered_error = filtered_error
-            previous_filtered_d = filtered_d
-
-            now_ms = ticks_ms()
-
-            elapsed_run_ms = ticks_diff(
-                now_ms,
-                run_start_ms,
-            )
-
-            in_late_safe = (
-                elapsed_run_ms >= LATE_SAFE_AFTER_MS
-                and elapsed_run_ms < LATE_SAFE_END_MS
-            )
-
-            in_post_late = (
-                elapsed_run_ms >= POST_LATE_AFTER_MS
-                and elapsed_run_ms < POST_LATE_END_MS
-            )
-
-            if in_late_safe:
-                late_safe_entered = True
-
-            if in_post_late:
-                post_late_entered = True
-
-            in_hard_corner = (
-                ticks_diff(
-                    hard_corner_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            # HARD_CORNER는 LATE_SAFE/POST_LATE 이전 FAST 구간에서만 사용한다.
-            # 후반부는 LATE/POST가 담당한다.
-            if (
-                on_line
-                and not in_late_safe
-                and not in_post_late
-                and detect_hard_corner_entry(
-                    filtered_error,
-                    filtered_d,
-                    current_speed,
-                )
-            ):
-                if ticks_diff(
-                    hard_corner_until_ms,
-                    now_ms,
-                ) <= 0:
-                    hard_corner_entry_count += 1
-
-                hard_corner_until_ms = (
-                    now_ms
-                    + HARD_CORNER_HOLD_MS
-                )
-
-            in_hard_corner = (
-                ticks_diff(
-                    hard_corner_until_ms,
-                    now_ms,
-                )
-                > 0
-            )
-
-            if elapsed_run_ms >= MIN_FINISH_MS:
-                if lap_timer.check_finish(
-                    norm,
-                    on_line,
-                ):
-                    finish_confirm_count += 1
-                else:
-                    finish_confirm_count = 0
-            else:
-                finish_confirm_count = 0
-
-            if finish_confirm_count >= FINISH_CONFIRM_COUNT:
-                motors.stop()
-
-                left_cmd = 0
-                right_cmd = 0
-
-                finished = True
-
-                if telemetry is not None:
-                    try:
-                        now = ticks_ms()
-
-                        if ticks_diff(
-                            now,
-                            network_cooldown_until_ms,
-                        ) >= 0:
-                            ok = telemetry.send_now(
-                                current_speed,
-                                norm,
-                                position,
-                                error,
-                                int(filtered_d),
-                                0,
-                                0,
-                                on_line,
-                                is_marker,
-                            )
-
-                            if ok:
-                                telemetry_sent_count += 1
-                            else:
-                                telemetry_skip_count += 1
-                        else:
-                            telemetry_skip_count += 1
-
-                    except Exception:
-                        telemetry_skip_count += 1
-
-                (
-                    ok,
-                    cost_ms,
-                ) = send_debug_message(
-                    debug_socket,
-                    (
-                        "type=finish,"
-                        "loops={},"
-                        "speed={},"
-                        "error={},"
-                        "filtered_error={:.1f},"
-                        "hard_entry={},"
-                        "late_safe={},"
-                        "post_late={}"
-                    ).format(
-                        loop_count,
-                        current_speed,
+                    telemetry.send_now(
+                        target_speed,
+                        norm,
+                        position,
                         error,
-                        filtered_error,
-                        hard_corner_entry_count,
-                        1 if late_safe_entered else 0,
-                        1 if post_late_entered else 0,
-                    ),
-                )
+                        0,
+                        0,
+                        0,
+                        on_line,
+                        is_marker,
 
-                if cost_ms > MAX_NETWORK_SEND_COST_MS:
-                    network_slow_count += 1
+                        encoders.distance_ticks,
+                        encoders.left_speed,
+                        encoders.right_speed,
+                        encoders.dl,
+                        encoders.dr,
+                        encoders.heading_ticks,
 
-                break
-
-            if on_line:
-                last_valid_error = filtered_error
-                lost_start_ms = None
-
-                if in_late_safe:
-                    target_speed = calculate_late_safe_speed(
-                        filtered_error,
-                        filtered_d,
+                        last_udp_loop_ms,
+                        last_udp_send_cost_ms,
+                        last_udp_overrun
                     )
 
-                    current_speed = move_speed(
-                        current_speed,
-                        target_speed,
-                    )
-
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        LATE_STEERING_LIMIT,
-                        allow_straight_damping=False,
-                    )
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        LATE_INNER_FLOOR,
-                        outer_boost=LATE_OUTER_BOOST,
-                    )
-
-                elif in_post_late:
-                    target_speed = calculate_post_late_speed(
-                        filtered_error,
-                        filtered_d,
-                    )
-
-                    current_speed = move_speed(
-                        current_speed,
-                        target_speed,
-                    )
-
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        POST_LATE_STEERING_LIMIT,
-                        allow_straight_damping=True,
-                    )
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        POST_LATE_INNER_FLOOR,
-                        outer_boost=POST_LATE_OUTER_BOOST,
-                    )
-
-                elif in_hard_corner:
-                    target_speed = HARD_CORNER_SPEED
-                    current_speed = HARD_CORNER_SPEED
-
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        HARD_CORNER_STEERING_LIMIT,
-                        allow_straight_damping=False,
-                    )
-
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        HARD_CORNER_INNER_FLOOR,
-                        outer_boost=HARD_CORNER_OUTER_BOOST,
-                    )
+                    break
 
                 else:
-                    target_speed = calculate_target_speed(
-                        filtered_error,
-                        filtered_d,
-                    )
+                    marker_count = 1
 
-                    current_speed = move_speed(
-                        current_speed,
-                        target_speed,
-                    )
+                    if DEBUG_MARKER:
+                        print(
+                            "EARLY_MARKER_IGNORED",
+                            "t=",
+                            elapsed_ms,
+                            "dist=",
+                            encoders.distance_ticks
+                        )
 
-                    steering = calculate_steering(
-                        filtered_error,
-                        filtered_d,
-                        STEERING_LIMIT,
-                        allow_straight_damping=True,
-                    )
+        # --------------------------------------------------------
+        # 3. PD 제어 + 엔코더 기반 속도 보정
+        # --------------------------------------------------------
 
-                    (
-                        left_cmd,
-                        right_cmd,
-                    ) = mix_motor(
-                        current_speed,
-                        steering,
-                        INNER_FLOOR,
-                        outer_boost=None,
-                    )
-
-                motors.drive(
-                    left_cmd,
-                    right_cmd,
-                )
-
+        if on_line:
+            if was_on_line:
+                d_error = error - last_error
             else:
-                if previous_on_line:
-                    line_lost_count += 1
-                    lost_start_ms = ticks_ms()
+                d_error = 0
 
-                if lost_start_ms is None:
-                    lost_start_ms = ticks_ms()
+            last_error = error
+            was_on_line = True
 
-                lost_elapsed_ms = ticks_diff(
-                    ticks_ms(),
-                    lost_start_ms,
-                )
-
-                (
-                    left_cmd,
-                    right_cmd,
-                ) = calculate_recovery_drive(
-                    last_valid_error,
-                    lost_elapsed_ms,
-                    in_late_safe,
-                    in_post_late,
-                )
-
-                if in_late_safe:
-                    target_speed = LATE_LOST_FORWARD
-                    current_speed = LATE_LOST_FORWARD
-
-                elif in_post_late:
-                    target_speed = POST_LATE_LOST_FORWARD
-                    current_speed = POST_LATE_LOST_FORWARD
-
-                else:
-                    target_speed = LOST_FORWARD
-                    current_speed = LOST_FORWARD
-
-                steering = 0
-
-                motors.drive(
-                    left_cmd,
-                    right_cmd,
-                )
-
-            previous_on_line = on_line
-
-            compute_mid = ticks_ms()
-
-            compute_before_network_ms = ticks_diff(
-                compute_mid,
-                loop_start,
+            distance_speed = speed_from_distance(
+                encoders.distance_ticks
             )
 
-            if telemetry is not None:
-                now = ticks_ms()
-
-                if compute_before_network_ms >= TELEMETRY_SKIP_COMPUTE_MS:
-                    telemetry_skip_count += 1
-
-                elif ticks_diff(
-                    now,
-                    network_cooldown_until_ms,
-                ) < 0:
-                    telemetry_skip_count += 1
-
-                else:
-                    send_start = ticks_ms()
-
-                    try:
-                        ok = telemetry.send_if_due(
-                            current_speed,
-                            norm,
-                            position,
-                            error,
-                            int(filtered_d),
-                            left_cmd,
-                            right_cmd,
-                            on_line,
-                            is_marker,
-                        )
-
-                        if ok:
-                            telemetry_sent_count += 1
-
-                    except Exception:
-                        telemetry_skip_count += 1
-                        ok = False
-
-                    send_cost_ms = ticks_diff(
-                        ticks_ms(),
-                        send_start,
-                    )
-
-                    if send_cost_ms > MAX_NETWORK_SEND_COST_MS:
-                        network_slow_count += 1
-                        network_cooldown_until_ms = (
-                            ticks_ms()
-                            + NETWORK_COOLDOWN_MS
-                        )
-
-            lap_timer.update()
-
-            compute_end = ticks_ms()
-
-            last_loop_ms = ticks_diff(
-                compute_end,
-                loop_start,
+            safe_speed = speed_from_error(
+                distance_speed,
+                error,
+                d_error
             )
 
-            total_compute_ms += last_loop_ms
-
-            if last_loop_ms > max_loop_ms:
-                max_loop_ms = last_loop_ms
-
-            if last_loop_ms >= OVERRUN_THRESHOLD_MS:
-                overrun_count += 1
-
-            if DEBUG_MODE:
-                now = ticks_ms()
-
-                debug_elapsed_ms = ticks_diff(
-                    now,
-                    last_debug_report_ms,
-                )
-
-                if debug_elapsed_ms >= DEBUG_REPORT_MS:
-                    if debug_elapsed_ms > DEBUG_REPORT_MAX_LAG_MS:
-                        debug_skip_count += 1
-                        last_debug_report_ms = now
-
-                    elif ticks_diff(
-                        now,
-                        network_cooldown_until_ms,
-                    ) < 0:
-                        debug_skip_count += 1
-                        last_debug_report_ms = now
-
-                    else:
-                        current_mode = mode_name(
-                            in_late_safe,
-                            in_post_late,
-                            in_hard_corner,
-                        )
-
-                        (
-                            ok,
-                            cost_ms,
-                        ) = send_debug_report(
-                            debug_socket,
-                            loop_count,
-                            overrun_count,
-                            max_loop_ms,
-                            last_loop_ms,
-                            target_speed,
-                            current_speed,
-                            error,
-                            filtered_error,
-                            filtered_d,
-                            confidence,
-                            active_count,
-                            steering,
-                            left_cmd,
-                            right_cmd,
-                            on_line,
-                            current_mode,
-                        )
-
-                        if cost_ms > MAX_NETWORK_SEND_COST_MS:
-                            network_slow_count += 1
-                            network_cooldown_until_ms = (
-                                ticks_ms()
-                                + NETWORK_COOLDOWN_MS
-                            )
-
-                        last_debug_report_ms = now
-
-            wait_control_period(
-                loop_start
+            speed_boost = encoder_speed_boost(
+                encoders,
+                safe_speed
             )
 
-    except KeyboardInterrupt:
-        send_debug_message(
-            debug_socket,
-            "type=stop,reason=keyboard_interrupt",
-        )
+            # 랩타임 단축 1단계:
+            # 커브 감속 상태에서도 양수 boost를 +30까지만 허용한다.
+            if safe_speed < STRAIGHT_SPEED:
+                if speed_boost > CURVE_POSITIVE_BOOST_LIMIT:
+                    speed_boost = CURVE_POSITIVE_BOOST_LIMIT
 
-    except Exception as exc:
-        send_debug_message(
-            debug_socket,
-            (
-                "type=error,"
-                "exception={}"
-            ).format(
-                exc.__class__.__name__
-            ),
-        )
+            target_speed = safe_speed + speed_boost
 
-        if lap_timer is not None:
-            try:
-                lap_timer.show(
-                    "ERROR",
-                    exc.__class__.__name__[:16],
-                    "Motor stopped",
-                    "",
-                )
-            except Exception:
-                pass
+            if target_speed > STRAIGHT_SPEED:
+                target_speed = STRAIGHT_SPEED
 
-        raise
+            if target_speed < MIN_RUN_SPEED:
+                target_speed = MIN_RUN_SPEED
 
-    finally:
-        if motors is not None:
+            correction = int(KP * error + KD * d_error)
+            correction = clamp_correction(correction)
+
+            left_cmd = limit_drive_cmd(
+                target_speed + correction,
+                error
+            )
+
+            right_cmd = limit_drive_cmd(
+                target_speed - correction,
+                error
+            )
+
+            motors.drive(left_cmd, right_cmd)
+
+            encoders.set_direction_from_cmd(left_cmd, right_cmd)
+
+        else:
+            # 아직 마지막 오차 방향 저속 탐색은 넣지 않는다.
             motors.stop()
+            encoders.set_direction_from_cmd(0, 0)
 
-        if telemetry is not None:
-            try:
-                (
-                    tele_sent,
-                    tele_drop_lag,
-                    tele_drop_busy,
-                    tele_slow,
-                ) = telemetry.get_stats()
+            d_error = 0
+            left_cmd = 0
+            right_cmd = 0
+            was_on_line = False
 
-                if tele_sent > telemetry_sent_count:
-                    telemetry_sent_count = tele_sent
+        # --------------------------------------------------------
+        # 4. 주행 데이터 전송
+        # --------------------------------------------------------
 
-                telemetry_skip_count += (
-                    tele_drop_lag
-                    + tele_drop_busy
-                )
+        sent = telemetry.send_if_due(
+            target_speed,
+            norm,
+            position,
+            error,
+            d_error,
+            left_cmd,
+            right_cmd,
+            on_line,
+            is_marker,
 
-                network_slow_count += tele_slow
+            encoders.distance_ticks,
+            encoders.left_speed,
+            encoders.right_speed,
+            encoders.dl,
+            encoders.dr,
+            encoders.heading_ticks,
 
-            except Exception:
-                pass
-
-        send_final_report(
-            debug_socket,
-            finished,
-            loop_count,
-            overrun_count,
-            max_loop_ms,
-            total_compute_ms,
-            line_lost_count,
-            hard_corner_entry_count,
-            late_safe_entered,
-            post_late_entered,
-            telemetry_sent_count,
-            telemetry_skip_count,
-            debug_skip_count,
-            network_slow_count,
+            last_udp_loop_ms,
+            last_udp_send_cost_ms,
+            last_udp_overrun
         )
 
-        if telemetry is not None:
-            telemetry.close()
+        loop_after_udp_ms = ticks_diff(ticks_ms(), loop_start)
 
-        if debug_socket is not None:
-            try:
-                debug_socket.close()
-            except Exception:
-                pass
+        if sent:
+            last_udp_loop_ms = loop_after_udp_ms
+            last_udp_send_cost_ms = telemetry.last_send_cost_ms
 
-        if lap_timer is not None and not finished:
-            try:
-                lap_timer.show_stopped()
-            except Exception:
-                pass
+            if loop_after_udp_ms > CONTROL_MS:
+                last_udp_overrun = 1
+            else:
+                last_udp_overrun = 0
+
+        # --------------------------------------------------------
+        # 5. OLED 갱신
+        # --------------------------------------------------------
+
+        lap_timer.update()
+
+        # --------------------------------------------------------
+        # 6. 제어 주기 맞추기
+        # --------------------------------------------------------
+
+        wait_control_period(loop_start)
 
 
-# ============================================================
-# Entry point
-# ============================================================
+finally:
+    motors.stop()
+    telemetry.close()
 
-run()
+    if not finished:
+        lap_timer.show_stopped()
