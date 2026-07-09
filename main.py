@@ -2,7 +2,8 @@
 # PAI-Car high-speed controller
 # - FAST mode for early/mid straight sections
 # - HARD_CORNER mode for sharp corners
-# - LATE_SAFE mode for final U-turn and following gentle curves
+# - LATE_SAFE mode only for final U-turn window
+# - POST_LATE mode for controlled speed recovery after U-turn
 # - UTURN forced rotation/capture removed
 # - UDP telemetry/debug compatible
 
@@ -96,7 +97,6 @@ HARD_CORNER_HARD_ERROR = 1900
 
 HARD_CORNER_HOLD_MS = 260
 
-# 기존보다 약간 완화.
 HARD_CORNER_SPEED = 460
 HARD_CORNER_STEERING_LIMIT = 720
 HARD_CORNER_INNER_FLOOR = 80
@@ -107,9 +107,10 @@ HARD_CORNER_OUTER_BOOST = 850
 # LATE_SAFE mode
 # ------------------------------------------------------------
 
-# 후반 U턴 및 U턴 이후 완만한 코너 전체를 안정 구간으로 처리.
-# 강제 U턴 회전 모드는 사용하지 않는다.
+# U턴 통과용 안정 구간.
+# 이 구간이 끝나면 더 이상 LATE_SAFE에 갇히지 않는다.
 LATE_SAFE_AFTER_MS = 36000
+LATE_SAFE_END_MS = 43500
 
 LATE_MAX_SPEED = 620
 LATE_BASE_SPEED = 540
@@ -121,9 +122,33 @@ LATE_HARD_ERROR = 1300
 
 LATE_STEERING_LIMIT = 620
 LATE_INNER_FLOOR = 100
-
-# 후반부에서는 boost/outer boost 금지.
 LATE_OUTER_BOOST = None
+
+
+# ------------------------------------------------------------
+# POST_LATE mode
+# ------------------------------------------------------------
+
+# U턴 이후 긴 직선/완만 코너에서 속도를 복구한다.
+# 바로 1000으로 풀지 않고 43.5~52초 동안 단계적으로 복귀한다.
+POST_LATE_AFTER_MS = LATE_SAFE_END_MS
+POST_LATE_END_MS = 52000
+
+POST_LATE_BASE_SPEED = 720
+POST_LATE_MAX_SPEED = 900
+
+POST_LATE_SLOW_SPEED = 620
+POST_LATE_HARD_SPEED = 500
+
+POST_LATE_SLOW_ERROR = 750
+POST_LATE_HARD_ERROR = 1500
+
+POST_LATE_BOOST_ERROR = 180
+POST_LATE_BOOST_D_ERROR = 50
+
+POST_LATE_STEERING_LIMIT = 620
+POST_LATE_INNER_FLOOR = 120
+POST_LATE_OUTER_BOOST = None
 
 
 # ------------------------------------------------------------
@@ -148,10 +173,13 @@ LOST_FORWARD = 250
 LOST_TURN = 900
 LOST_PIVOT_AFTER_MS = 120
 
-# 후반부는 강제 피벗을 약화한다.
 LATE_LOST_FORWARD = 220
 LATE_LOST_TURN = 650
 LATE_LOST_PIVOT_AFTER_MS = 180
+
+POST_LATE_LOST_FORWARD = 240
+POST_LATE_LOST_TURN = 750
+POST_LATE_LOST_PIVOT_AFTER_MS = 160
 
 
 # ------------------------------------------------------------
@@ -269,10 +297,14 @@ def count_active_sensors(norm):
 
 def mode_name(
     in_late_safe,
+    in_post_late,
     in_hard_corner,
 ):
     if in_late_safe:
         return "LATE"
+
+    if in_post_late:
+        return "POST"
 
     if in_hard_corner:
         return "HARD"
@@ -379,6 +411,36 @@ def calculate_late_safe_speed(
         target,
         LATE_HARD_SPEED,
         LATE_MAX_SPEED,
+    )
+
+
+def calculate_post_late_speed(
+    filtered_error,
+    filtered_d,
+):
+    abs_error = abs(
+        filtered_error
+    )
+
+    if abs_error >= POST_LATE_HARD_ERROR:
+        target = POST_LATE_HARD_SPEED
+
+    elif abs_error >= POST_LATE_SLOW_ERROR:
+        target = POST_LATE_SLOW_SPEED
+
+    else:
+        target = POST_LATE_BASE_SPEED
+
+    if (
+        abs_error < POST_LATE_BOOST_ERROR
+        and abs(filtered_d) < POST_LATE_BOOST_D_ERROR
+    ):
+        target = POST_LATE_MAX_SPEED
+
+    return clamp(
+        target,
+        POST_LATE_HARD_SPEED,
+        POST_LATE_MAX_SPEED,
     )
 
 
@@ -591,11 +653,18 @@ def calculate_recovery_drive(
     last_error,
     lost_elapsed_ms,
     in_late_safe,
+    in_post_late,
 ):
     if in_late_safe:
         forward = LATE_LOST_FORWARD
         turn = LATE_LOST_TURN
         pivot_after = LATE_LOST_PIVOT_AFTER_MS
+
+    elif in_post_late:
+        forward = POST_LATE_LOST_FORWARD
+        turn = POST_LATE_LOST_TURN
+        pivot_after = POST_LATE_LOST_PIVOT_AFTER_MS
+
     else:
         forward = LOST_FORWARD
         turn = LOST_TURN
@@ -775,6 +844,7 @@ def send_final_report(
     line_lost_count,
     hard_corner_entry_count,
     late_safe_entered,
+    post_late_entered,
     telemetry_sent_count,
     telemetry_skip_count,
     debug_skip_count,
@@ -801,7 +871,7 @@ def send_final_report(
     message = (
         "type=final,"
         "finished={},"
-        "mode=HIGH_SPEED_LATE_SAFE,"
+        "mode=HIGH_SPEED_LATE_POST,"
         "control_ms={},"
         "loops={},"
         "average_compute_ms={:.3f},"
@@ -811,6 +881,7 @@ def send_final_report(
         "line_lost_entry={},"
         "hard_entry={},"
         "late_safe={},"
+        "post_late={},"
         "telemetry_sent={},"
         "telemetry_skip={},"
         "debug_skip={},"
@@ -826,6 +897,7 @@ def send_final_report(
         line_lost_count,
         hard_corner_entry_count,
         1 if late_safe_entered else 0,
+        1 if post_late_entered else 0,
         telemetry_sent_count,
         telemetry_skip_count,
         debug_skip_count,
@@ -845,10 +917,16 @@ def send_final_report(
 def show_running_mode(lap_timer):
     try:
         lap_timer.show(
-            "HIGH LATE SAFE",
-            "BASE {}".format(BASE_SPEED),
+            "LATE POST",
+            "L {}-{}".format(
+                LATE_SAFE_AFTER_MS,
+                LATE_SAFE_END_MS,
+            ),
+            "P {}-{}".format(
+                POST_LATE_AFTER_MS,
+                POST_LATE_END_MS,
+            ),
             "MAX {}".format(MAX_SPEED),
-            "LATE {}".format(LATE_SAFE_AFTER_MS),
         )
     except Exception:
         pass
@@ -877,6 +955,7 @@ def run():
     line_lost_count = 0
     hard_corner_entry_count = 0
     late_safe_entered = False
+    post_late_entered = False
 
     telemetry_sent_count = 0
     telemetry_skip_count = 0
@@ -936,15 +1015,15 @@ def run():
                 (
                     "type=boot,"
                     "telemetry_ok={},"
-                    "mode=HIGH_SPEED_LATE_SAFE,"
+                    "mode=HIGH_SPEED_LATE_POST,"
                     "control_ms={},"
                     "base_speed={},"
                     "max_speed={},"
                     "kp={:.3f},"
                     "kd={:.3f},"
                     "late_after={},"
-                    "late_base={},"
-                    "late_max={}"
+                    "late_end={},"
+                    "post_end={}"
                 ).format(
                     telemetry_ok,
                     CONTROL_MS,
@@ -953,8 +1032,8 @@ def run():
                     KP,
                     KD,
                     LATE_SAFE_AFTER_MS,
-                    LATE_BASE_SPEED,
-                    LATE_MAX_SPEED,
+                    LATE_SAFE_END_MS,
+                    POST_LATE_END_MS,
                 ),
             )
 
@@ -1058,10 +1137,19 @@ def run():
 
             in_late_safe = (
                 elapsed_run_ms >= LATE_SAFE_AFTER_MS
+                and elapsed_run_ms < LATE_SAFE_END_MS
+            )
+
+            in_post_late = (
+                elapsed_run_ms >= POST_LATE_AFTER_MS
+                and elapsed_run_ms < POST_LATE_END_MS
             )
 
             if in_late_safe:
                 late_safe_entered = True
+
+            if in_post_late:
+                post_late_entered = True
 
             in_hard_corner = (
                 ticks_diff(
@@ -1071,11 +1159,12 @@ def run():
                 > 0
             )
 
-            # HARD_CORNER는 LATE_SAFE 이전에만 강하게 사용한다.
-            # 후반부에서는 LATE_SAFE가 전체를 담당한다.
+            # HARD_CORNER는 LATE_SAFE/POST_LATE 이전 FAST 구간에서만 사용한다.
+            # 후반부는 LATE/POST가 담당한다.
             if (
                 on_line
                 and not in_late_safe
+                and not in_post_late
                 and detect_hard_corner_entry(
                     filtered_error,
                     filtered_d,
@@ -1162,7 +1251,8 @@ def run():
                         "error={},"
                         "filtered_error={:.1f},"
                         "hard_entry={},"
-                        "late_safe={}"
+                        "late_safe={},"
+                        "post_late={}"
                     ).format(
                         loop_count,
                         current_speed,
@@ -1170,6 +1260,7 @@ def run():
                         filtered_error,
                         hard_corner_entry_count,
                         1 if late_safe_entered else 0,
+                        1 if post_late_entered else 0,
                     ),
                 )
 
@@ -1208,6 +1299,34 @@ def run():
                         steering,
                         LATE_INNER_FLOOR,
                         outer_boost=LATE_OUTER_BOOST,
+                    )
+
+                elif in_post_late:
+                    target_speed = calculate_post_late_speed(
+                        filtered_error,
+                        filtered_d,
+                    )
+
+                    current_speed = move_speed(
+                        current_speed,
+                        target_speed,
+                    )
+
+                    steering = calculate_steering(
+                        filtered_error,
+                        filtered_d,
+                        POST_LATE_STEERING_LIMIT,
+                        allow_straight_damping=True,
+                    )
+
+                    (
+                        left_cmd,
+                        right_cmd,
+                    ) = mix_motor(
+                        current_speed,
+                        steering,
+                        POST_LATE_INNER_FLOOR,
+                        outer_boost=POST_LATE_OUTER_BOOST,
                     )
 
                 elif in_hard_corner:
@@ -1284,11 +1403,17 @@ def run():
                     last_valid_error,
                     lost_elapsed_ms,
                     in_late_safe,
+                    in_post_late,
                 )
 
                 if in_late_safe:
                     target_speed = LATE_LOST_FORWARD
                     current_speed = LATE_LOST_FORWARD
+
+                elif in_post_late:
+                    target_speed = POST_LATE_LOST_FORWARD
+                    current_speed = POST_LATE_LOST_FORWARD
+
                 else:
                     target_speed = LOST_FORWARD
                     current_speed = LOST_FORWARD
@@ -1396,6 +1521,7 @@ def run():
                     else:
                         current_mode = mode_name(
                             in_late_safe,
+                            in_post_late,
                             in_hard_corner,
                         )
 
@@ -1501,6 +1627,7 @@ def run():
             line_lost_count,
             hard_corner_entry_count,
             late_safe_entered,
+            post_late_entered,
             telemetry_sent_count,
             telemetry_skip_count,
             debug_skip_count,
