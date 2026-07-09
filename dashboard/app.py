@@ -1,15 +1,22 @@
 # app.py
-# PAI-Car Step 2 PyQtGraph telemetry dashboard
+# PAI-Car Step 3 PyQtGraph telemetry dashboard + UDP command sender
 #
 # 목적:
-#   Pico 2 W의 기존 UDP telemetry packet VERSION 1을 PC에서 수신한다.
-#   차량 제어 로직은 전혀 수정하지 않고, 실시간 표시와 CSV 저장만 수행한다.
+#   1. Pico 2 W의 기존 UDP telemetry packet VERSION 1을 PC에서 수신한다.
+#   2. 실시간 plot과 CSV 저장을 수행한다.
+#   3. PC 키 입력으로 PING / STOP / SAFE_MODE / RUN command를 Pico로 전송한다.
 #
 # 실행:
 #   python app.py
 #
 # 필요 패키지:
 #   python -m pip install pyqtgraph PyQt6
+#
+# 키:
+#   P       PING
+#   Space   STOP
+#   Z       SAFE_MODE
+#   Enter   RUN
 
 import csv
 import os
@@ -30,14 +37,49 @@ except ImportError:
     except ImportError:
         from PyQt5 import QtCore, QtWidgets
 
+from command_sender import (
+    CommandSender,
+    CMD_PING,
+    CMD_STOP,
+    CMD_SAFE_MODE,
+    CMD_RUN,
+)
+
 
 # ------------------------------------------------------------
-# UDP receive settings
+# Qt compatibility
+# ------------------------------------------------------------
+
+QT_KEY = getattr(QtCore.Qt, "Key", QtCore.Qt)
+
+KEY_P = getattr(QT_KEY, "Key_P")
+KEY_Z = getattr(QT_KEY, "Key_Z")
+KEY_SPACE = getattr(QT_KEY, "Key_Space")
+KEY_RETURN = getattr(QT_KEY, "Key_Return")
+KEY_ENTER = getattr(QT_KEY, "Key_Enter")
+
+
+def text_selectable_flag():
+    if hasattr(QtCore.Qt, "TextInteractionFlag"):
+        return QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+    return QtCore.Qt.TextSelectableByMouse
+
+
+def run_qt_app(app):
+    if hasattr(app, "exec"):
+        return app.exec()
+    return app.exec_()
+
+
+# ------------------------------------------------------------
+# UDP telemetry receive settings
 # ------------------------------------------------------------
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 5005
 RECV_BUFFER_SIZE = 2048
+
+COMMAND_PORT = 5006
 
 
 # ------------------------------------------------------------
@@ -72,6 +114,7 @@ CSV_HEADER = [
 LOG_DIR = "logs"
 MAX_POINTS = 1500
 RECV_TIMER_MS = 5
+COMMAND_TIMER_MS = 20
 PLOT_TIMER_MS = 33
 FLUSH_EVERY_ROWS = 20
 
@@ -145,12 +188,17 @@ class Dashboard(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("PAI-Car Step 2 Telemetry Dashboard")
-        self.resize(1200, 850)
+        self.setWindowTitle("PAI-Car Step 3 Telemetry Dashboard + Command Sender")
+        self.resize(1200, 880)
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((LISTEN_IP, LISTEN_PORT))
-        self.sock.setblocking(False)
+        self.telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.telemetry_sock.bind((LISTEN_IP, LISTEN_PORT))
+        self.telemetry_sock.setblocking(False)
+
+        self.command_sender = CommandSender(
+            target_ip=None,
+            target_port=COMMAND_PORT,
+        )
 
         os.makedirs(LOG_DIR, exist_ok=True)
         self.csv_path = os.path.join(
@@ -168,6 +216,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.last_packet_time = None
         self.last_row = None
         self.last_bad_reason = ""
+        self.last_pico_ip = None
         self.closed = False
 
         self.t_buf = deque(maxlen=MAX_POINTS)
@@ -186,6 +235,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.recv_timer.timeout.connect(self.receive_available_packets)
         self.recv_timer.start(RECV_TIMER_MS)
 
+        self.command_timer = QtCore.QTimer(self)
+        self.command_timer.timeout.connect(self.poll_command_acks)
+        self.command_timer.start(COMMAND_TIMER_MS)
+
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_plots)
         self.plot_timer.start(PLOT_TIMER_MS)
@@ -196,9 +249,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
 
         self.status_label = QtWidgets.QLabel()
-        self.status_label.setTextInteractionFlags(
-            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
-        )
+        self.status_label.setTextInteractionFlags(text_selectable_flag())
         layout.addWidget(self.status_label)
 
         self.graph = pg.GraphicsLayoutWidget()
@@ -260,7 +311,7 @@ class Dashboard(QtWidgets.QMainWindow):
     def receive_available_packets(self):
         while True:
             try:
-                data, _addr = self.sock.recvfrom(RECV_BUFFER_SIZE)
+                data, addr = self.telemetry_sock.recvfrom(RECV_BUFFER_SIZE)
             except BlockingIOError:
                 break
             except OSError:
@@ -271,6 +322,10 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.bad_packet_count += 1
                 self.last_bad_reason = reason or "unknown"
                 continue
+
+            pico_ip = addr[0]
+            self.last_pico_ip = pico_ip
+            self.command_sender.set_target_ip(pico_ip)
 
             now_wall = datetime.now().isoformat(timespec="milliseconds")
             self.last_packet_time = time.monotonic()
@@ -300,6 +355,45 @@ class Dashboard(QtWidgets.QMainWindow):
 
             self.last_row = row
 
+    def poll_command_acks(self):
+        self.command_sender.poll_acks()
+
+    def send_command(self, cmd_type):
+        info = self.command_sender.send(cmd_type)
+        if info is None:
+            print("command not sent:", self.command_sender.last_error)
+            return
+
+        print(
+            "sent command: seq={} cmd={} target={}:{}".format(
+                info["seq"],
+                info["cmd_name"],
+                info["target_ip"],
+                info["target_port"],
+            )
+        )
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key == KEY_P:
+            self.send_command(CMD_PING)
+            return
+
+        if key == KEY_SPACE:
+            self.send_command(CMD_STOP)
+            return
+
+        if key == KEY_Z:
+            self.send_command(CMD_SAFE_MODE)
+            return
+
+        if key == KEY_RETURN or key == KEY_ENTER:
+            self.send_command(CMD_RUN)
+            return
+
+        super().keyPressEvent(event)
+
     def update_status_label(self):
         if self.received_count > 0:
             denom = self.received_count + self.packet_loss_count
@@ -308,7 +402,7 @@ class Dashboard(QtWidgets.QMainWindow):
             loss_rate = 0.0
 
         if self.last_row is None:
-            current = "no packet yet"
+            current = "no telemetry packet yet"
         else:
             current = (
                 "seq={seq}  t_ms={t_ms}  control_ms={control_ms}  send_ms={send_ms}  "
@@ -316,9 +410,15 @@ class Dashboard(QtWidgets.QMainWindow):
                 "left={left_cmd}  right={right_cmd}  on_line={on_line}  marker={is_marker}"
             ).format(**self.last_row)
 
+        command_help = "keys: P=PING  Space=STOP  Z=SAFE_MODE  Enter=RUN"
+
         self.status_label.setText(
-            "listen={}:{}  packet_size={}  version={}  received={}  lost={} ({:.2f}%)  "
-            "bad={}  last_age={}ms  bad_reason={}\nCSV={}\n{}".format(
+            "telemetry_listen={}:{}  packet_size={}  version={}  "
+            "received={}  lost={} ({:.2f}%)  bad={}  last_age={}ms  bad_reason={}\n"
+            "{}\n"
+            "{}\n"
+            "CSV={}\n"
+            "{}".format(
                 LISTEN_IP,
                 LISTEN_PORT,
                 PACKET_SIZE,
@@ -329,6 +429,8 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.bad_packet_count,
                 self.last_packet_age_ms(),
                 self.last_bad_reason,
+                self.command_sender.stats_text(),
+                command_help,
                 self.csv_path,
                 current,
             )
@@ -380,7 +482,12 @@ class Dashboard(QtWidgets.QMainWindow):
             pass
 
         try:
-            self.sock.close()
+            self.telemetry_sock.close()
+        except Exception:
+            pass
+
+        try:
+            self.command_sender.close()
         except Exception:
             pass
 
@@ -394,7 +501,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = Dashboard()
     window.show()
-    code = app.exec()
+    code = run_qt_app(app)
     window.close_resources()
     sys.exit(code)
 
