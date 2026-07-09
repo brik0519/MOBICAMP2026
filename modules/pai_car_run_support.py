@@ -58,7 +58,7 @@ NOISE_CUTOFF = 100
 # Default P-control support settings
 # ------------------------------------------------------------
 
-CONTROL_MS = 5 #10     # 제어 주기는 10ms 또는 5ms 둘 중 하나 선택
+CONTROL_MS = 10     # 제어 주기는 10ms 또는 5ms 둘 중 하나 선택
                     # 전송 주기는 제어 주기의 정수 배
                     # 전송 주기 = n x CONTROL_MS
 

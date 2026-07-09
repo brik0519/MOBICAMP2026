@@ -1,16 +1,15 @@
 # pai_udp_telemetry.py
 # PAI-Car UDP binary telemetry module
 #
-# 확장 내용:
-#   - encoder distance_ticks, left_speed, right_speed, dl, dr, heading_ticks 전송
-#   - UDP 송신이 포함된 루프의 loop_ms 전송
-#   - UDP 송신 비용 send_cost_ms 전송
-#   - loop_ms > CONTROL_MS 여부 overrun 전송
+# 역할:
+#   - Pico 2 W Wi-Fi 연결
+#   - UDP socket 생성
+#   - 주행 데이터를 binary packet으로 변환
+#   - 20ms 주기로 PC에 전송
 #
-# 주의:
-#   - PC 수신 코드의 PACKET_FORMAT과 CSV_HEADER도 반드시 같이 바꿔야 한다.
+# 이 파일은 학생들이 자주 볼 필요가 없는 통신 관련 코드를 모아 둔다.
 
-from time import ticks_ms, ticks_us, ticks_diff, sleep_ms
+from time import ticks_ms, ticks_diff, sleep_ms
 import network
 import socket
 import struct
@@ -36,18 +35,17 @@ from modules.pai_car_wifi_config import (
 # ------------------------------------------------------------
 
 SEND_MS = 20
+
 WIFI_TIMEOUT_MS = 15000
 
-MAGIC = 0x5041
-VERSION = 2
+MAGIC = 0x5041     # packet identifier
+VERSION = 1
 RESERVED = 0
 
 
 # ------------------------------------------------------------
 # Binary packet format
 # ------------------------------------------------------------
-#
-# 기존 44 bytes에서 encoder/timing 필드를 추가한다.
 #
 # <      : little-endian
 # H      : magic, uint16
@@ -67,20 +65,9 @@ RESERVED = 0
 # B      : on_line, uint8
 # B      : is_marker, uint8
 #
-# i      : distance_ticks, int32
-# h      : left_speed, int16
-# h      : right_speed, int16
-# h      : dl, int16
-# h      : dr, int16
-# i      : heading_ticks, int32
-# H      : udp_loop_ms, uint16
-# H      : udp_send_cost_ms, uint16
-# B      : udp_overrun, uint8
-# B      : reserved2, uint8
-#
-# Total: 66 bytes
+# Total: 44 bytes
 
-PACKET_FORMAT = "<HBBHIHHh8HHhhhhBBihhhhihhBB"
+PACKET_FORMAT = "<HBBHIHHh8HHhhhhBB"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 
 
@@ -89,6 +76,25 @@ PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 # ------------------------------------------------------------
 
 def read_line_detail(line):
+    """
+    라인센서 값을 읽고 제어/전송에 필요한 값을 반환한다.
+
+    반환값:
+        error, position, norm, on_line
+
+    error:
+        position - 3500
+
+    position:
+        왼쪽 끝 0, 중앙 3500, 오른쪽 끝 7000
+
+    norm:
+        8개 라인센서 정규화값, 0~1000
+
+    on_line:
+        라인 감지 여부
+    """
+
     error, position, norm, on_line = line.read_error(
         min_total=MIN_TOTAL,
         noise_cutoff=NOISE_CUTOFF
@@ -98,6 +104,13 @@ def read_line_detail(line):
 
 
 def is_t_marker_area(norm, on_line):
+    """
+    현재 순간이 T 마커 구간인지 판단한다.
+
+    lap_timer.check_finish()는 T 마커 '이벤트'를 세는 함수이고,
+    이 함수는 현재 센서 상태가 T 마커 위인지 여부만 반환한다.
+    """
+
     if not on_line:
         return False
 
@@ -111,50 +124,23 @@ def is_t_marker_area(norm, on_line):
 
 
 # ------------------------------------------------------------
-# Safe conversion helper
-# ------------------------------------------------------------
-
-def clamp_i16(value):
-    value = int(value)
-
-    if value > 32767:
-        return 32767
-
-    if value < -32768:
-        return -32768
-
-    return value
-
-
-def clamp_u16(value):
-    value = int(value)
-
-    if value > 65535:
-        return 65535
-
-    if value < 0:
-        return 0
-
-    return value
-
-
-def clamp_i32(value):
-    value = int(value)
-
-    if value > 2147483647:
-        return 2147483647
-
-    if value < -2147483648:
-        return -2147483648
-
-    return value
-
-
-# ------------------------------------------------------------
 # Wi-Fi / UDP telemetry class
 # ------------------------------------------------------------
 
 class PAIUdpTelemetry:
+    """
+    PAI-Car 주행 데이터를 PC로 전송하는 클래스.
+
+    main 파일에서는 다음 정도만 사용하면 된다.
+
+        telemetry = PAIUdpTelemetry(lap_timer)
+        telemetry.begin()
+        telemetry.reset_timer()
+        telemetry.send_if_due(...)
+        telemetry.send_now(...)
+        telemetry.close()
+    """
+
     def __init__(self, lap_timer=None):
         self.lap_timer = lap_timer
 
@@ -167,41 +153,31 @@ class PAIUdpTelemetry:
 
         self.enabled = False
 
-        # 마지막 UDP 송신 비용.
-        # 현재 패킷에는 직전 송신 비용이 기록된다.
-        self.last_send_cost_ms = 0
-
-        # send_if_due()가 직전 호출에서 실제 전송했는지 여부
-        self.last_sent = False
-
     def begin(self):
+        """
+        Wi-Fi에 연결하고 UDP socket을 준비한다.
+
+        실패해도 주행 자체는 가능하도록 enabled=False 상태로 둔다.
+        """
+
         if not self._connect_wifi():
             self.enabled = False
             return False
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-            # 매우 중요:
-            # UDP sendto가 제어 루프를 오래 붙잡지 않도록 non-blocking으로 둔다.
-            try:
-                self.sock.setblocking(False)
-            except Exception:
-                pass
-
             self.enabled = True
 
             print("UDP telemetry ready")
             print("Target:", PC_IP, PC_PORT)
             print("Packet size:", PACKET_SIZE)
-            print("Packet version:", VERSION)
 
             if self.lap_timer is not None:
                 self.lap_timer.show(
                     "UDP READY",
                     PC_IP[:16],
                     "port {}".format(PC_PORT),
-                    "size {}".format(PACKET_SIZE)
+                    ""
                 )
 
             return True
@@ -216,11 +192,13 @@ class PAIUdpTelemetry:
             return False
 
     def reset_timer(self):
+        """
+        주행 시작 시점에 맞춰 전송 시간 기준을 초기화한다.
+        """
+
         now = ticks_ms()
         self.run_start_ms = now
         self.last_send_ms = now
-        self.last_send_cost_ms = 0
-        self.last_sent = False
 
     def send_if_due(
         self,
@@ -232,38 +210,23 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker,
-        distance_ticks=0,
-        left_speed=0,
-        right_speed=0,
-        dl=0,
-        dr=0,
-        heading_ticks=0,
-        udp_loop_ms=0,
-        udp_send_cost_ms=0,
-        udp_overrun=0
+        is_marker
     ):
         """
         SEND_MS가 지났으면 주행 데이터를 한 번 전송한다.
-
-        반환값:
-            True  -> 이번 호출에서 실제 전송함
-            False -> 전송하지 않음
         """
 
-        self.last_sent = False
-
         if not self.enabled:
-            return False
+            return
 
         now = ticks_ms()
 
         if ticks_diff(now, self.last_send_ms) < SEND_MS:
-            return False
+            return
 
         t_ms = ticks_diff(now, self.run_start_ms)
 
-        ok = self._send_packet(
+        self._send_packet(
             t_ms,
             base_speed,
             norm,
@@ -273,22 +236,10 @@ class PAIUdpTelemetry:
             left_cmd,
             right_cmd,
             on_line,
-            is_marker,
-            distance_ticks,
-            left_speed,
-            right_speed,
-            dl,
-            dr,
-            heading_ticks,
-            udp_loop_ms,
-            udp_send_cost_ms,
-            udp_overrun
+            is_marker
         )
 
         self.last_send_ms = now
-        self.last_sent = ok
-
-        return ok
 
     def send_now(
         self,
@@ -300,24 +251,20 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker,
-        distance_ticks=0,
-        left_speed=0,
-        right_speed=0,
-        dl=0,
-        dr=0,
-        heading_ticks=0,
-        udp_loop_ms=0,
-        udp_send_cost_ms=0,
-        udp_overrun=0
+        is_marker
     ):
+        """
+        전송 주기와 관계없이 주행 데이터를 즉시 한 번 전송한다.
+        Finish 순간의 마지막 상태를 보낼 때 사용한다.
+        """
+
         if not self.enabled:
-            return False
+            return
 
         now = ticks_ms()
         t_ms = ticks_diff(now, self.run_start_ms)
 
-        ok = self._send_packet(
+        self._send_packet(
             t_ms,
             base_speed,
             norm,
@@ -327,24 +274,16 @@ class PAIUdpTelemetry:
             left_cmd,
             right_cmd,
             on_line,
-            is_marker,
-            distance_ticks,
-            left_speed,
-            right_speed,
-            dl,
-            dr,
-            heading_ticks,
-            udp_loop_ms,
-            udp_send_cost_ms,
-            udp_overrun
+            is_marker
         )
 
         self.last_send_ms = now
-        self.last_sent = ok
-
-        return ok
 
     def close(self):
+        """
+        UDP socket을 닫는다.
+        """
+
         if self.sock is not None:
             try:
                 self.sock.close()
@@ -355,6 +294,10 @@ class PAIUdpTelemetry:
         self.enabled = False
 
     def _connect_wifi(self):
+        """
+        Pico 2 W를 Wi-Fi에 연결한다.
+        """
+
         if WIFI_SSID == "" or WIFI_SSID == "YOUR_WIFI_SSID":
             print("Wi-Fi SSID is not set. UDP disabled.")
 
@@ -379,12 +322,7 @@ class PAIUdpTelemetry:
                     print("Wi-Fi connection failed. UDP disabled.")
 
                     if self.lap_timer is not None:
-                        self.lap_timer.show(
-                            "WiFi FAILED",
-                            "UDP disabled",
-                            "",
-                            ""
-                        )
+                        self.lap_timer.show("WiFi FAILED", "UDP disabled", "", "")
 
                     return False
 
@@ -409,18 +347,11 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker,
-        distance_ticks,
-        left_speed,
-        right_speed,
-        dl,
-        dr,
-        heading_ticks,
-        udp_loop_ms,
-        udp_send_cost_ms,
-        udp_overrun
+        is_marker
     ):
-        start_us = ticks_us()
+        """
+        실제 binary packet을 만들어 PC로 전송한다.
+        """
 
         try:
             packet = struct.pack(
@@ -432,48 +363,29 @@ class PAIUdpTelemetry:
                 int(t_ms),
                 CONTROL_MS,
                 SEND_MS,
-                clamp_i16(base_speed),
+                int(base_speed),
 
-                clamp_u16(norm[0]),
-                clamp_u16(norm[1]),
-                clamp_u16(norm[2]),
-                clamp_u16(norm[3]),
-                clamp_u16(norm[4]),
-                clamp_u16(norm[5]),
-                clamp_u16(norm[6]),
-                clamp_u16(norm[7]),
+                int(norm[0]),
+                int(norm[1]),
+                int(norm[2]),
+                int(norm[3]),
+                int(norm[4]),
+                int(norm[5]),
+                int(norm[6]),
+                int(norm[7]),
 
-                clamp_u16(position),
-                clamp_i16(error),
-                clamp_i16(d_error),
-                clamp_i16(left_cmd),
-                clamp_i16(right_cmd),
+                int(position),
+                int(error),
+                int(d_error),
+                int(left_cmd),
+                int(right_cmd),
                 1 if on_line else 0,
-                1 if is_marker else 0,
-
-                clamp_i32(distance_ticks),
-                clamp_i16(left_speed),
-                clamp_i16(right_speed),
-                clamp_i16(dl),
-                clamp_i16(dr),
-                clamp_i32(heading_ticks),
-                clamp_u16(udp_loop_ms),
-                clamp_u16(udp_send_cost_ms),
-                1 if udp_overrun else 0,
-                0
+                1 if is_marker else 0
             )
 
             self.sock.sendto(packet, (PC_IP, PC_PORT))
             self.seq = (self.seq + 1) & 0xFFFF
 
-            cost_us = ticks_diff(ticks_us(), start_us)
-            self.last_send_cost_ms = clamp_u16((cost_us + 999) // 1000)
-
-            return True
-
         except OSError:
-            # non-blocking UDP에서 전송 실패가 발생해도 주행을 멈추면 안 된다.
-            cost_us = ticks_diff(ticks_us(), start_us)
-            self.last_send_cost_ms = clamp_u16((cost_us + 999) // 1000)
-
-            return False
+            # 전송 실패가 발생해도 주행이 멈추지 않도록 무시한다.
+            pass
