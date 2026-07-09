@@ -4,7 +4,8 @@
 # - single KP / KD tuning
 # - error-based speed control
 # - straight boost up to 1000
-# - U-turn / emergency curvature mode
+# - U-turn / emergency curvature mode with time gate
+# - early gentle curve false-trigger prevention
 # - simple motor mixer
 # - short strong line-loss recovery
 # - UDP telemetry/debug compatible
@@ -52,11 +53,12 @@ BASE_SPEED = 850
 MAX_SPEED = 1000
 MIN_SPEED = 420
 
-SLOW_ERROR = 850
-HARD_ERROR = 1800
+# 초반 완만한 커브에서 UTURN 오판 없이 일반 감속으로 버티기 위한 값.
+SLOW_ERROR = 750
+HARD_ERROR = 1500
 
-SLOW_SPEED = 680
-HARD_SPEED = 470
+SLOW_SPEED = 700
+HARD_SPEED = 520
 
 BOOST_ERROR = 220
 BOOST_D_ERROR = 70
@@ -90,6 +92,10 @@ STRAIGHT_DAMP_GAIN_2 = 0.75
 # ------------------------------------------------------------
 # U-turn / emergency curvature mode
 # ------------------------------------------------------------
+
+# 마지막 U턴이 있는 구간 전까지는 UTURN 모드 발동 금지.
+# 초반 완만한 커브를 UTURN으로 오판하는 것을 막는다.
+UTURN_ENABLE_AFTER_MS = 6500
 
 # 실제로 “U턴 위치”를 아는 것이 아니라,
 # 고속 + 오차 증가 + 센서 끝 몰림 상태를 급곡률/U턴으로 간주한다.
@@ -330,6 +336,7 @@ def calculate_target_speed(
     else:
         target = BASE_SPEED
 
+    # 직선 안정 구간 boost.
     if (
         abs_error < BOOST_ERROR
         and abs(filtered_d) < BOOST_D_ERROR
@@ -366,6 +373,7 @@ def damp_steering_on_straight(
         filtered_d
     )
 
+    # 중심 근처이고 변화율도 작으면 직선으로 보고 잔류 조향을 빠르게 죽인다.
     if (
         abs_error < STRAIGHT_DAMP_ERROR_1
         and abs_d < STRAIGHT_DAMP_D_1
@@ -677,6 +685,7 @@ def send_debug_report(
     right_cmd,
     on_line,
     in_uturn,
+    uturn_detection_enabled,
 ):
     if debug_socket is None:
         return (
@@ -703,7 +712,8 @@ def send_debug_report(
         "left={},"
         "right={},"
         "on_line={},"
-        "uturn={}"
+        "uturn={},"
+        "uturn_enabled={}"
     ).format(
         loop_count,
         target_speed,
@@ -723,6 +733,7 @@ def send_debug_report(
         right_cmd,
         1 if on_line else 0,
         1 if in_uturn else 0,
+        1 if uturn_detection_enabled else 0,
     )
 
     return send_debug_message(
@@ -766,7 +777,7 @@ def send_final_report(
     message = (
         "type=final,"
         "finished={},"
-        "mode=HIGH_SPEED_UTURN,"
+        "mode=HIGH_SPEED_UTURN_GATED,"
         "control_ms={},"
         "loops={},"
         "average_compute_ms={:.3f},"
@@ -808,10 +819,10 @@ def send_final_report(
 def show_running_mode(lap_timer):
     try:
         lap_timer.show(
-            "HIGH UTURN",
+            "HIGH U-GATED",
             "BASE {}".format(BASE_SPEED),
             "MAX {}".format(MAX_SPEED),
-            "U {}".format(UTURN_SPEED),
+            "U after {}ms".format(UTURN_ENABLE_AFTER_MS),
         )
     except Exception:
         pass
@@ -898,12 +909,15 @@ def run():
                 (
                     "type=boot,"
                     "telemetry_ok={},"
-                    "mode=HIGH_SPEED_UTURN,"
+                    "mode=HIGH_SPEED_UTURN_GATED,"
                     "control_ms={},"
                     "base_speed={},"
                     "max_speed={},"
                     "kp={:.3f},"
                     "kd={:.3f},"
+                    "slow_error={},"
+                    "hard_error={},"
+                    "uturn_after={},"
                     "uturn_speed={},"
                     "uturn_hold={}"
                 ).format(
@@ -913,6 +927,9 @@ def run():
                     MAX_SPEED,
                     KP,
                     KD,
+                    SLOW_ERROR,
+                    HARD_ERROR,
+                    UTURN_ENABLE_AFTER_MS,
                     UTURN_SPEED,
                     UTURN_HOLD_MS,
                 ),
@@ -1011,8 +1028,18 @@ def run():
 
             now_ms = ticks_ms()
 
+            elapsed_run_ms = ticks_diff(
+                now_ms,
+                run_start_ms,
+            )
+
+            uturn_detection_enabled = (
+                elapsed_run_ms >= UTURN_ENABLE_AFTER_MS
+            )
+
             if (
                 on_line
+                and uturn_detection_enabled
                 and detect_uturn_entry(
                     filtered_error,
                     filtered_d,
@@ -1037,11 +1064,6 @@ def run():
                     now_ms,
                 )
                 > 0
-            )
-
-            elapsed_run_ms = ticks_diff(
-                now_ms,
-                run_start_ms,
             )
 
             if elapsed_run_ms >= MIN_FINISH_MS:
@@ -1322,6 +1344,7 @@ def run():
                             right_cmd,
                             on_line,
                             in_uturn,
+                            uturn_detection_enabled,
                         )
 
                         if cost_ms > MAX_NETWORK_SEND_COST_MS:
