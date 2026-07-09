@@ -111,7 +111,7 @@ CURVE_ACCEL_WEIGHT = 0.10
 # 코너 좌우 흔들림 완화를 위해 curve/sharp gain을 낮춘다.
 KP_STRAIGHT = 0.20
 KP_CURVE = 0.24
-KP_SHARP = 0.28
+KP_SHARP = 0.30
 
 KD_STRAIGHT = 0.65
 KD_CURVE = 0.55
@@ -132,7 +132,7 @@ STEERING_FILTER_ALPHA = 0.26
 # 조향 변화율 제한.
 STEERING_SLEW_STRAIGHT = 45
 STEERING_SLEW_CURVE = 35
-STEERING_SLEW_SHARP = 28
+STEERING_SLEW_SHARP = 32
 
 
 # ============================================================
@@ -171,7 +171,7 @@ MOTOR_FALL_STEP = 160
 
 ALLOW_REVERSE_TRACKING = False
 
-INNER_MIN_TRACKING_CMD = 90
+INNER_MIN_TRACKING_CMD = 110
 
 
 # ============================================================
