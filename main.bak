@@ -35,7 +35,6 @@ from modules.pai_udp_telemetry import (
     read_line_detail,
 )
 
-from modules.pai_udp_command import PAIUdpCommand
 
 # ------------------------------------------------------------
 # PD-control settings
@@ -234,8 +233,6 @@ line, motors, button = setup_paicar(lap_timer)
 telemetry = PAIUdpTelemetry(lap_timer)
 telemetry.begin()
 
-cmd = PAIUdpCommand(require_heartbeat=False)
-cmd.begin()
 
 # ------------------------------------------------------------
 # Self calibration
@@ -287,9 +284,6 @@ try:
         # --------------------------------------------------------
         # 1. 라인센서 읽기
         # --------------------------------------------------------
-        cmd.poll()
-        force_stop = cmd.should_force_stop()
-
 
         error, position, norm, on_line = read_line_detail(line)
 
@@ -366,34 +360,7 @@ try:
                 error
             )
 
-            # if force_stop:
-            #     target_speed = 0
-            #     left_cmd = 0
-            #     right_cmd = 0
-            #     motors.stop()
-            # else:
-            #     motors.drive(left_cmd, right_cmd)
-
-            if force_stop:
-                left_cmd = 0
-                right_cmd = 0
-                motors.stop()
-
-            else:
-                if loss_ms <= LINE_LOSS_MAX_MS:
-                    if last_error < 0:
-                        left_cmd = -SEARCH_PWM
-                        right_cmd = SEARCH_PWM
-                    else:
-                        left_cmd = SEARCH_PWM
-                        right_cmd = -SEARCH_PWM
-
-                    motors.drive(left_cmd, right_cmd)
-
-                else:
-                    left_cmd = 0
-                    right_cmd = 0
-                    motors.stop()
+            motors.drive(left_cmd, right_cmd)
 
         else:
             now = ticks_ms()
@@ -477,7 +444,6 @@ try:
 finally:
     motors.stop()
     telemetry.close()
-    cmd.close()
 
     if not finished:
         lap_timer.show_stopped()
