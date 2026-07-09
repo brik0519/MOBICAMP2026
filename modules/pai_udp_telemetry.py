@@ -6,6 +6,8 @@
 #   - UDP socket 생성
 #   - 주행 데이터를 binary packet으로 변환
 #   - 20ms 주기로 PC에 전송
+#   - non-blocking UDP 전송
+#   - 네트워크 지연 시 오래된 telemetry 샘플 삭제
 #
 # 이 파일은 학생들이 자주 볼 필요가 없는 통신 관련 코드를 모아 둔다.
 
@@ -38,9 +40,18 @@ SEND_MS = 20
 
 WIFI_TIMEOUT_MS = 15000
 
-MAGIC = 0x5041     # packet identifier
+MAGIC = 0x5041
 VERSION = 1
 RESERVED = 0
+
+# 전송이 SEND_MS보다 과도하게 늦어진 경우 오래된 샘플로 보고 삭제한다.
+MAX_SEND_LAG_MS = 45
+
+# sendto()가 이 시간보다 오래 걸리면 네트워크가 느린 상태로 보고 cooldown에 들어간다.
+MAX_SEND_COST_MS = 2
+
+# 네트워크가 느린 것으로 감지된 뒤 이 시간 동안 telemetry 전송을 건너뛴다.
+TELEMETRY_COOLDOWN_MS = 100
 
 
 # ------------------------------------------------------------
@@ -55,7 +66,7 @@ RESERVED = 0
 # I      : t_ms, uint32
 # H      : control_ms, uint16
 # H      : send_ms, uint16
-# h      : base_speed, int16
+# h      : current_speed, int16
 # 8H     : n0~n7, uint16 x 8
 # H      : position, uint16
 # h      : error, int16
@@ -97,7 +108,7 @@ def read_line_detail(line):
 
     error, position, norm, on_line = line.read_error(
         min_total=MIN_TOTAL,
-        noise_cutoff=NOISE_CUTOFF
+        noise_cutoff=NOISE_CUTOFF,
     )
 
     return error, position, norm, on_line
@@ -138,6 +149,7 @@ class PAIUdpTelemetry:
         telemetry.reset_timer()
         telemetry.send_if_due(...)
         telemetry.send_now(...)
+        telemetry.get_stats()
         telemetry.close()
     """
 
@@ -153,6 +165,12 @@ class PAIUdpTelemetry:
 
         self.enabled = False
 
+        self.sent_count = 0
+        self.drop_lag_count = 0
+        self.drop_busy_count = 0
+        self.slow_send_count = 0
+        self.cooldown_until_ms = 0
+
     def begin(self):
         """
         Wi-Fi에 연결하고 UDP socket을 준비한다.
@@ -165,7 +183,16 @@ class PAIUdpTelemetry:
             return False
 
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_DGRAM,
+            )
+
+            try:
+                self.sock.setblocking(False)
+            except Exception:
+                pass
+
             self.enabled = True
 
             print("UDP telemetry ready")
@@ -177,7 +204,7 @@ class PAIUdpTelemetry:
                     "UDP READY",
                     PC_IP[:16],
                     "port {}".format(PC_PORT),
-                    ""
+                    "",
                 )
 
             return True
@@ -186,7 +213,12 @@ class PAIUdpTelemetry:
             print("UDP socket error:", e)
 
             if self.lap_timer is not None:
-                self.lap_timer.show("UDP ERROR", "socket failed", "", "")
+                self.lap_timer.show(
+                    "UDP ERROR",
+                    "socket failed",
+                    "",
+                    "",
+                )
 
             self.enabled = False
             return False
@@ -197,8 +229,15 @@ class PAIUdpTelemetry:
         """
 
         now = ticks_ms()
+
         self.run_start_ms = now
         self.last_send_ms = now
+        self.cooldown_until_ms = 0
+
+        self.sent_count = 0
+        self.drop_lag_count = 0
+        self.drop_busy_count = 0
+        self.slow_send_count = 0
 
     def send_if_due(
         self,
@@ -210,23 +249,47 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker
+        is_marker,
     ):
         """
         SEND_MS가 지났으면 주행 데이터를 한 번 전송한다.
+
+        반환값:
+            True  -> 실제 송신 성공
+            False -> 아직 전송 시점이 아니거나, 지연/혼잡으로 샘플 삭제
         """
 
         if not self.enabled:
-            return
+            return False
 
         now = ticks_ms()
 
-        if ticks_diff(now, self.last_send_ms) < SEND_MS:
-            return
+        if ticks_diff(
+            now,
+            self.cooldown_until_ms,
+        ) < 0:
+            return False
 
-        t_ms = ticks_diff(now, self.run_start_ms)
+        elapsed_ms = ticks_diff(
+            now,
+            self.last_send_ms,
+        )
 
-        self._send_packet(
+        if elapsed_ms < SEND_MS:
+            return False
+
+        # 제어 루프나 네트워크 지연으로 너무 늦어진 샘플은 오래된 데이터이므로 삭제한다.
+        if elapsed_ms > MAX_SEND_LAG_MS:
+            self.drop_lag_count += 1
+            self.last_send_ms = now
+            return False
+
+        t_ms = ticks_diff(
+            now,
+            self.run_start_ms,
+        )
+
+        ok = self._send_packet(
             t_ms,
             base_speed,
             norm,
@@ -236,10 +299,11 @@ class PAIUdpTelemetry:
             left_cmd,
             right_cmd,
             on_line,
-            is_marker
+            is_marker,
         )
 
         self.last_send_ms = now
+        return ok
 
     def send_now(
         self,
@@ -251,20 +315,34 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker
+        is_marker,
     ):
         """
         전송 주기와 관계없이 주행 데이터를 즉시 한 번 전송한다.
         Finish 순간의 마지막 상태를 보낼 때 사용한다.
+
+        반환값:
+            True  -> 실제 송신 성공
+            False -> 비활성 또는 송신 실패
         """
 
         if not self.enabled:
-            return
+            return False
 
         now = ticks_ms()
-        t_ms = ticks_diff(now, self.run_start_ms)
 
-        self._send_packet(
+        if ticks_diff(
+            now,
+            self.cooldown_until_ms,
+        ) < 0:
+            return False
+
+        t_ms = ticks_diff(
+            now,
+            self.run_start_ms,
+        )
+
+        ok = self._send_packet(
             t_ms,
             base_speed,
             norm,
@@ -274,10 +352,23 @@ class PAIUdpTelemetry:
             left_cmd,
             right_cmd,
             on_line,
-            is_marker
+            is_marker,
         )
 
         self.last_send_ms = now
+        return ok
+
+    def get_stats(self):
+        """
+        main.py final report에서 사용할 telemetry 통계를 반환한다.
+        """
+
+        return (
+            self.sent_count,
+            self.drop_lag_count,
+            self.drop_busy_count,
+            self.slow_send_count,
+        )
 
     def close(self):
         """
@@ -302,27 +393,48 @@ class PAIUdpTelemetry:
             print("Wi-Fi SSID is not set. UDP disabled.")
 
             if self.lap_timer is not None:
-                self.lap_timer.show("UDP OFF", "Set WiFi info", "", "")
+                self.lap_timer.show(
+                    "UDP OFF",
+                    "Set WiFi info",
+                    "",
+                    "",
+                )
 
             return False
 
         if self.lap_timer is not None:
-            self.lap_timer.show("WiFi", "Connecting...", "", "")
+            self.lap_timer.show(
+                "WiFi",
+                "Connecting...",
+                "",
+                "",
+            )
 
         self.wlan = network.WLAN(network.STA_IF)
         self.wlan.active(True)
 
         if not self.wlan.isconnected():
-            self.wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            self.wlan.connect(
+                WIFI_SSID,
+                WIFI_PASSWORD,
+            )
 
             start = ticks_ms()
 
             while not self.wlan.isconnected():
-                if ticks_diff(ticks_ms(), start) >= WIFI_TIMEOUT_MS:
+                if ticks_diff(
+                    ticks_ms(),
+                    start,
+                ) >= WIFI_TIMEOUT_MS:
                     print("Wi-Fi connection failed. UDP disabled.")
 
                     if self.lap_timer is not None:
-                        self.lap_timer.show("WiFi FAILED", "UDP disabled", "", "")
+                        self.lap_timer.show(
+                            "WiFi FAILED",
+                            "UDP disabled",
+                            "",
+                            "",
+                        )
 
                     return False
 
@@ -332,7 +444,12 @@ class PAIUdpTelemetry:
         print("Wi-Fi connected:", ip)
 
         if self.lap_timer is not None:
-            self.lap_timer.show("WiFi OK", ip[:16], "", "")
+            self.lap_timer.show(
+                "WiFi OK",
+                ip[:16],
+                "",
+                "",
+            )
 
         return True
 
@@ -347,11 +464,19 @@ class PAIUdpTelemetry:
         left_cmd,
         right_cmd,
         on_line,
-        is_marker
+        is_marker,
     ):
         """
         실제 binary packet을 만들어 PC로 전송한다.
+
+        non-blocking sendto()가 실패하면 샘플을 버리고 False를 반환한다.
         """
+
+        if self.sock is None:
+            self.enabled = False
+            return False
+
+        start_ms = ticks_ms()
 
         try:
             packet = struct.pack(
@@ -380,12 +505,37 @@ class PAIUdpTelemetry:
                 int(left_cmd),
                 int(right_cmd),
                 1 if on_line else 0,
-                1 if is_marker else 0
+                1 if is_marker else 0,
             )
 
-            self.sock.sendto(packet, (PC_IP, PC_PORT))
-            self.seq = (self.seq + 1) & 0xFFFF
+            self.sock.sendto(
+                packet,
+                (
+                    PC_IP,
+                    PC_PORT,
+                ),
+            )
+
+            cost_ms = ticks_diff(
+                ticks_ms(),
+                start_ms,
+            )
+
+            if cost_ms > MAX_SEND_COST_MS:
+                self.slow_send_count += 1
+                self.cooldown_until_ms = (
+                    ticks_ms()
+                    + TELEMETRY_COOLDOWN_MS
+                )
+
+            self.seq = (
+                self.seq + 1
+            ) & 0xFFFF
+
+            self.sent_count += 1
+            return True
 
         except OSError:
-            # 전송 실패가 발생해도 주행이 멈추지 않도록 무시한다.
-            pass
+            self.drop_busy_count += 1
+            self.last_send_ms = ticks_ms()
+            return False

@@ -1,0 +1,1 @@
+pc_time,sender,type,loop,drive,speed_state,target,current,compute_ms,max_ms,overrun,error,filtered_error,filtered_rate,confidence,active,wide,curve,kp,kd,p,d,steering,scale,left,right,finished,mode,control_ms,loops,average_compute_ms,max_compute_ms,overrun_count,overrun_rate,line_lost_entry,telemetry_sent,telemetry_skip,debug_skip,network_slow,raw_message
