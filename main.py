@@ -1,8 +1,6 @@
 # main.py
 # PAI-Car v1.0 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
 #
-# 무엔코더 안정 버전 + 기본 finish 판별 롤백
-#
 # 유지:
 #   - 엔코더 없는 모터 기준
 #   - error / d_error 기반 속도 제어
@@ -11,11 +9,14 @@
 #
 # 추가:
 #   - PC -> Pico UDP command 수신
-#   - PING / STOP / SAFE_MODE / RUN 지원
-#   - STOP / SAFE_MODE 상태에서는 최종 모터 출력만 0으로 덮어씀
+#   - PING / NEXT_SECTION / EMERGENCY_STOP / RUN 지원
+#   - Space는 트랙 구간 변경 marker로 사용하며 정지하지 않음
+#   - Z emergency stop 상태에서는 최종 모터 출력만 0으로 덮어씀
+#   - Z 정지 중에는 finish 판별과 lap timer update를 중단
+#   - Enter 재개 시 정지 시간만큼 주행 시간을 보정
 #   - 버튼 직후 시작선 중복 finish 오검출 방지
 
-from time import ticks_ms, ticks_diff
+from time import ticks_ms, ticks_diff, ticks_add
 
 from modules.pai_car_run_support import (
     create_lap_timer,
@@ -78,9 +79,6 @@ LINE_LOSS_MAX_MS = 250
 T_MARKER_TH = 700
 T_MARKER_MIN_COUNT = 6
 
-# 시작선 위에서 버튼을 누른 직후,
-# 같은 시작선을 finish로 중복 인식하지 않도록
-# marker가 사라진 상태를 연속 몇 회 확인할지 결정한다.
 START_MARKER_RELEASE_COUNT = 5
 
 
@@ -99,13 +97,6 @@ def clamp_correction(value):
 
 
 def limit_drive_cmd(value, error):
-    """
-    정상 라인트레이싱 중 모터 출력 제한.
-
-    error가 작을 때는 역회전 금지.
-    error가 클 때만 제한적 역회전 허용.
-    """
-
     ae = abs(error)
 
     if ae >= 2400:
@@ -135,11 +126,6 @@ def count_black_sensors(norm):
 
 
 def marker_detected_now(norm, on_line):
-    """
-    CSV 표시용 marker 판정.
-    정지 판정에는 직접 사용하지 않는다.
-    """
-
     if not on_line:
         return False
 
@@ -149,13 +135,6 @@ def marker_detected_now(norm, on_line):
 
 
 def arm_start_marker_if_needed(lap_timer, norm, on_line):
-    """
-    버튼을 누른 직후 차량이 시작선 위에 있으면,
-    시작 marker를 이미 1회 본 상태로 둔다.
-
-    이렇게 해야 finish 지점에서 다음 marker가 2번째 marker로 처리된다.
-    """
-
     if marker_detected_now(norm, on_line):
         lap_timer.t_marker_count = 1
         lap_timer.t_marker_active = True
@@ -214,6 +193,17 @@ def send_stop_packet(
         on_line,
         is_marker
     )
+
+
+def enter_pause(lap_timer):
+    motors.stop()
+    lap_timer.show("PAUSE", "Z STOP", "Enter: RUN", "")
+
+
+def exit_pause(lap_timer):
+    lap_timer.t_marker_active = False
+    lap_timer.t_marker_release_count = 0
+    lap_timer.show("RUN", "RESUME", "", "")
 
 
 # ------------------------------------------------------------
@@ -283,12 +273,13 @@ target_speed = BASE_SPEED
 
 line_lost_start_ms = None
 
+paused = False
+pause_start_ms = 0
+
 try:
     while True:
         loop_start = ticks_ms()
-        now_ms = ticks_ms()
-
-        elapsed_ms = ticks_diff(now_ms, run_start_ms)
+        now_ms = loop_start
 
         # --------------------------------------------------------
         # 0. PC command 수신
@@ -296,6 +287,36 @@ try:
 
         cmd.poll()
         force_stop = cmd.should_force_stop()
+
+        # --------------------------------------------------------
+        # 0-1. Z emergency stop pause / Enter resume
+        # --------------------------------------------------------
+
+        if force_stop and not paused:
+            paused = True
+            pause_start_ms = now_ms
+
+            target_speed = 0
+            left_cmd = 0
+            right_cmd = 0
+            d_error = 0
+
+            motors.stop()
+            enter_pause(lap_timer)
+
+        elif paused and not force_stop:
+            paused_ms = ticks_diff(now_ms, pause_start_ms)
+
+            run_start_ms = ticks_add(run_start_ms, paused_ms)
+            lap_timer.start_ms = ticks_add(lap_timer.start_ms, paused_ms)
+            lap_timer.last_update_ms = ticks_add(lap_timer.last_update_ms, paused_ms)
+
+            exit_pause(lap_timer)
+
+            paused = False
+            pause_start_ms = 0
+
+        elapsed_ms = ticks_diff(now_ms, run_start_ms)
 
         # --------------------------------------------------------
         # 1. 라인센서 읽기
@@ -306,133 +327,128 @@ try:
         is_marker = marker_detected_now(norm, on_line)
 
         # --------------------------------------------------------
-        # 2. Finish 확인
+        # 2. Pause 상태
         # --------------------------------------------------------
         #
-        # 시작선 위에서 버튼을 누른 경우,
-        # 시작선을 완전히 벗어나기 전까지 finish 판별을 막는다.
-        #
-        # 단, 시작선을 그냥 무시하는 것이 아니라
-        # start marker를 이미 1회 본 상태로 둔다.
-        # 그래야 실제 finish 선에서 정지할 수 있다.
+        # Z 긴급 정지 중에는:
+        #   - finish 판별 금지
+        #   - lap_timer.update 금지
+        #   - 모터 정지 유지
+        #   - telemetry는 계속 송신
 
-        if not start_marker_released:
-            if marker_detected_now(norm, on_line):
-                start_marker_release_count = 0
-            else:
-                start_marker_release_count += 1
-
-                if start_marker_release_count >= START_MARKER_RELEASE_COUNT:
-                    start_marker_released = True
-                    lap_timer.t_marker_active = False
-                    lap_timer.t_marker_release_count = 0
+        if paused:
+            target_speed = 0
+            left_cmd = 0
+            right_cmd = 0
+            d_error = 0
+            motors.stop()
 
         else:
-            if lap_timer.check_finish(norm, on_line):
-                d_error = 0
-                left_cmd = 0
-                right_cmd = 0
-                target_speed = 0
+            # ----------------------------------------------------
+            # 3. Finish 확인
+            # ----------------------------------------------------
 
-                motors.stop()
-                finished = True
+            if not start_marker_released:
+                if marker_detected_now(norm, on_line):
+                    start_marker_release_count = 0
+                else:
+                    start_marker_release_count += 1
 
-                send_stop_packet(
-                    telemetry,
-                    target_speed,
-                    norm,
-                    position,
+                    if start_marker_release_count >= START_MARKER_RELEASE_COUNT:
+                        start_marker_released = True
+                        lap_timer.t_marker_active = False
+                        lap_timer.t_marker_release_count = 0
+
+            else:
+                if lap_timer.check_finish(norm, on_line):
+                    d_error = 0
+                    left_cmd = 0
+                    right_cmd = 0
+                    target_speed = 0
+
+                    motors.stop()
+                    finished = True
+
+                    send_stop_packet(
+                        telemetry,
+                        target_speed,
+                        norm,
+                        position,
+                        error,
+                        on_line,
+                        is_marker
+                    )
+
+                    break
+
+            # ----------------------------------------------------
+            # 4. PD 제어 + 라인 미검출 복구
+            # ----------------------------------------------------
+
+            if on_line:
+                line_lost_start_ms = None
+
+                if was_on_line:
+                    d_error = error - last_error
+                else:
+                    d_error = 0
+
+                last_error = error
+                was_on_line = True
+
+                time_speed = speed_from_time(elapsed_ms)
+
+                target_speed = speed_from_error(
+                    time_speed,
                     error,
-                    on_line,
-                    is_marker
+                    d_error
                 )
 
-                break
+                correction = int(KP * error + KD * d_error)
+                correction = clamp_correction(correction)
 
-        # --------------------------------------------------------
-        # 3. PD 제어 + 라인 미검출 복구
-        # --------------------------------------------------------
+                left_cmd = limit_drive_cmd(
+                    target_speed + correction,
+                    error
+                )
 
-        if on_line:
-            line_lost_start_ms = None
-
-            if was_on_line:
-                d_error = error - last_error
-            else:
-                d_error = 0
-
-            last_error = error
-            was_on_line = True
-
-            time_speed = speed_from_time(elapsed_ms)
-
-            target_speed = speed_from_error(
-                time_speed,
-                error,
-                d_error
-            )
-
-            correction = int(KP * error + KD * d_error)
-            correction = clamp_correction(correction)
-
-            left_cmd = limit_drive_cmd(
-                target_speed + correction,
-                error
-            )
-
-            right_cmd = limit_drive_cmd(
-                target_speed - correction,
-                error
-            )
-
-            motors.drive(left_cmd, right_cmd)
-
-        else:
-            now = ticks_ms()
-
-            if line_lost_start_ms is None:
-                line_lost_start_ms = now
-
-            loss_ms = ticks_diff(now, line_lost_start_ms)
-
-            d_error = 0
-            target_speed = 0
-            was_on_line = False
-
-            if loss_ms <= LINE_LOSS_MAX_MS:
-                if last_error < 0:
-                    left_cmd = -SEARCH_PWM
-                    right_cmd = SEARCH_PWM
-                else:
-                    left_cmd = SEARCH_PWM
-                    right_cmd = -SEARCH_PWM
+                right_cmd = limit_drive_cmd(
+                    target_speed - correction,
+                    error
+                )
 
                 motors.drive(left_cmd, right_cmd)
 
             else:
-                left_cmd = 0
-                right_cmd = 0
-                motors.stop()
+                now = ticks_ms()
+
+                if line_lost_start_ms is None:
+                    line_lost_start_ms = now
+
+                loss_ms = ticks_diff(now, line_lost_start_ms)
+
+                d_error = 0
+                target_speed = 0
+                was_on_line = False
+
+                if loss_ms <= LINE_LOSS_MAX_MS:
+                    if last_error < 0:
+                        left_cmd = -SEARCH_PWM
+                        right_cmd = SEARCH_PWM
+                    else:
+                        left_cmd = SEARCH_PWM
+                        right_cmd = -SEARCH_PWM
+
+                    motors.drive(left_cmd, right_cmd)
+
+                else:
+                    left_cmd = 0
+                    right_cmd = 0
+                    motors.stop()
 
         # --------------------------------------------------------
-        # 3-1. PC STOP / SAFE_MODE 강제 정지
+        # 5. 주행 데이터 전송
         # --------------------------------------------------------
-        #
-        # 기존 라인트레이싱 계산과 복구 로직은 그대로 수행한 뒤,
-        # STOP 또는 SAFE_MODE 상태일 때만 최종 모터 출력을 0으로 덮어쓴다.
-
-        if force_stop:
-            target_speed = 0
-            left_cmd = 0
-            right_cmd = 0
-            motors.stop()
-
-        # --------------------------------------------------------
-        # 4. 주행 데이터 전송
-        # --------------------------------------------------------
-        #
-        # 현재 pai_udp_telemetry.py는 기본 V1 telemetry 인자만 받는다.
-        # 따라서 distance_ticks, udp_loop_ms 등 확장 인자는 보내지 않는다.
 
         telemetry.send_if_due(
             target_speed,
@@ -447,13 +463,14 @@ try:
         )
 
         # --------------------------------------------------------
-        # 5. OLED 갱신
+        # 6. OLED 갱신
         # --------------------------------------------------------
 
-        lap_timer.update()
+        if not paused:
+            lap_timer.update()
 
         # --------------------------------------------------------
-        # 6. 제어 주기 맞추기
+        # 7. 제어 주기 맞추기
         # --------------------------------------------------------
 
         wait_control_period(loop_start)
