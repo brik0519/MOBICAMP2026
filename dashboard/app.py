@@ -1,12 +1,13 @@
 # app.py
-# PAI-Car Step 5-2 PyQtGraph telemetry dashboard + course_map section display
+# PAI-Car Step 5-3 PyQtGraph telemetry dashboard + course_map + profiles
 #
 # 목적:
 #   1. Pico 2 W의 기존 UDP telemetry packet VERSION 1을 PC에서 수신한다.
 #   2. 실시간 plot과 CSV 저장을 수행한다.
 #   3. PC 키 입력으로 PING / NEXT_SECTION / EMERGENCY_STOP / RUN command를 Pico로 전송한다.
 #   4. Space 입력 시 현재 telemetry snapshot을 section_marks.csv에 저장한다.
-#   5. course_map.json을 읽어 현재 section의 이름, 종류, profile_key, role을 표시하고 기록한다.
+#   5. course_map.json을 읽어 현재 section 정보를 표시하고 기록한다.
+#   6. profiles.json을 읽어 현재 section의 profile 값을 표시하고 기록한다.
 #
 # 실행:
 #   python app.py
@@ -81,6 +82,7 @@ def run_qt_app(app):
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 COURSE_MAP_PATH = os.path.join(APP_DIR, "course_map.json")
+PROFILES_PATH = os.path.join(APP_DIR, "profiles.json")
 LOG_DIR = os.path.join(APP_DIR, "logs")
 
 
@@ -136,6 +138,25 @@ SECTION_MARK_HEADER = [
     "profile_key",
     "section_role",
     "section_note",
+
+    "profile_label_ko",
+    "profile_base_speed",
+    "profile_curve_speed",
+    "profile_sharp_curve_speed",
+    "profile_min_run_speed",
+    "profile_kp",
+    "profile_kd",
+    "profile_max_correction",
+    "profile_reverse_allow",
+    "profile_reverse_pwm_mid",
+    "profile_reverse_pwm_high",
+    "profile_error_curve_threshold",
+    "profile_error_sharp_threshold",
+    "profile_d_error_curve_threshold",
+    "profile_d_error_sharp_threshold",
+    "profile_search_pwm",
+    "profile_line_loss_max_ms",
+
     "cmd_seq",
     "ack",
     "status",
@@ -163,26 +184,28 @@ SECTION_ACK_TIMEOUT_MS = 1000
 
 
 # ------------------------------------------------------------
-# Course map
+# Course map / profiles
 # ------------------------------------------------------------
 
-def load_course_map(path):
+def load_json_file(path, fallback_name):
     try:
         with open(path, "r", encoding="utf-8") as f:
-            course_map = json.load(f)
+            data = json.load(f)
 
-        return course_map, "loaded"
+        return data, "loaded"
 
     except FileNotFoundError:
         return {
-            "course_name": "missing_course_map",
+            "name": fallback_name,
             "sections": [],
+            "profiles": {},
         }, "missing: {}".format(path)
 
     except Exception as exc:
         return {
-            "course_name": "invalid_course_map",
+            "name": fallback_name,
             "sections": [],
+            "profiles": {},
         }, "error: {}".format(exc)
 
 
@@ -212,6 +235,29 @@ def default_section_info(section_id):
         "profile_key": "UNKNOWN",
         "role": "UNKNOWN",
         "note": "",
+    }
+
+
+def default_profile_info(profile_key):
+    return {
+        "label_ko": "알 수 없는 profile",
+        "base_speed": "",
+        "curve_speed": "",
+        "sharp_curve_speed": "",
+        "min_run_speed": "",
+        "kp": "",
+        "kd": "",
+        "max_correction": "",
+        "reverse_allow": "",
+        "reverse_pwm_mid": "",
+        "reverse_pwm_high": "",
+        "error_curve_threshold": "",
+        "error_sharp_threshold": "",
+        "d_error_curve_threshold": "",
+        "d_error_sharp_threshold": "",
+        "search_pwm": "",
+        "line_loss_max_ms": "",
+        "note": "missing profile: {}".format(profile_key),
     }
 
 
@@ -284,14 +330,17 @@ class Dashboard(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("PAI-Car Step 5-2 Telemetry Dashboard + Course Map")
-        self.resize(1200, 900)
+        self.setWindowTitle("PAI-Car Step 5-3 Telemetry Dashboard + Profiles")
+        self.resize(1200, 920)
 
         # --------------------------------------------------------
         # Course map
         # --------------------------------------------------------
 
-        self.course_map, self.course_map_status = load_course_map(COURSE_MAP_PATH)
+        self.course_map, self.course_map_status = load_json_file(
+            COURSE_MAP_PATH,
+            "missing_course_map",
+        )
         self.sections_by_id, self.section_ids = build_section_index(self.course_map)
 
         if self.section_ids:
@@ -300,6 +349,16 @@ class Dashboard(QtWidgets.QMainWindow):
             self.current_section_id = 0
 
         self.pending_section_marks = {}
+
+        # --------------------------------------------------------
+        # Profiles
+        # --------------------------------------------------------
+
+        self.profile_doc, self.profile_status = load_json_file(
+            PROFILES_PATH,
+            "missing_profiles",
+        )
+        self.profiles = self.profile_doc.get("profiles", {})
 
         # --------------------------------------------------------
         # UDP sockets
@@ -439,7 +498,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.update_status_label()
 
     # ------------------------------------------------------------
-    # Section helpers
+    # Section / profile helpers
     # ------------------------------------------------------------
 
     def get_section_info(self, section_id=None):
@@ -451,6 +510,17 @@ class Dashboard(QtWidgets.QMainWindow):
             default_section_info(section_id),
         )
 
+    def get_profile_info(self, profile_key):
+        return self.profiles.get(
+            profile_key,
+            default_profile_info(profile_key),
+        )
+
+    def get_current_profile_info(self):
+        section = self.get_section_info()
+        profile_key = section.get("profile_key", "UNKNOWN")
+        return self.get_profile_info(profile_key)
+
     def get_next_section_id(self):
         if not self.section_ids:
             return (self.current_section_id + 1) & 0xFFFF
@@ -459,7 +529,6 @@ class Dashboard(QtWidgets.QMainWindow):
             if section_id > self.current_section_id:
                 return section_id
 
-        # 마지막 section 이후에는 더 넘기지 않는다.
         return self.current_section_id
 
     def current_section_text(self):
@@ -477,6 +546,30 @@ class Dashboard(QtWidgets.QMainWindow):
             section.get("type", ""),
             section.get("profile_key", ""),
             section.get("role", ""),
+        )
+
+    def current_profile_text(self):
+        section = self.get_section_info()
+        profile_key = section.get("profile_key", "UNKNOWN")
+        profile = self.get_profile_info(profile_key)
+
+        return (
+            "profiles_status={}  "
+            "profile={}  label={}  base={}  curve={}  sharp={}  "
+            "kp={}  kd={}  max_corr={}  reverse={}  search={}  loss_ms={}"
+        ).format(
+            self.profile_status,
+            profile_key,
+            profile.get("label_ko", ""),
+            profile.get("base_speed", ""),
+            profile.get("curve_speed", ""),
+            profile.get("sharp_curve_speed", ""),
+            profile.get("kp", ""),
+            profile.get("kd", ""),
+            profile.get("max_correction", ""),
+            profile.get("reverse_allow", ""),
+            profile.get("search_pwm", ""),
+            profile.get("line_loss_max_ms", ""),
         )
 
     # ------------------------------------------------------------
@@ -591,6 +684,8 @@ class Dashboard(QtWidgets.QMainWindow):
 
         snapshot = dict(self.last_row)
         new_section_info = dict(self.get_section_info(new_section_id))
+        profile_key = new_section_info.get("profile_key", "UNKNOWN")
+        new_profile_info = dict(self.get_profile_info(profile_key))
 
         info = self.command_sender.send(CMD_NEXT_SECTION)
         if info is None:
@@ -602,17 +697,19 @@ class Dashboard(QtWidgets.QMainWindow):
             "old_section_id": old_section_id,
             "new_section_id": new_section_id,
             "new_section_info": new_section_info,
+            "new_profile_info": new_profile_info,
             "sent_wall_time": datetime.now().isoformat(timespec="milliseconds"),
             "sent_time": time.monotonic(),
         }
 
         print(
-            "sent NEXT_SECTION: seq={} {} -> {}  {} / {}".format(
+            "sent NEXT_SECTION: seq={} {} -> {}  {} / {} / profile={}".format(
                 info["seq"],
                 old_section_id,
                 new_section_id,
                 new_section_info.get("label_ko", ""),
                 new_section_info.get("type", ""),
+                profile_key,
             )
         )
 
@@ -667,6 +764,7 @@ class Dashboard(QtWidgets.QMainWindow):
     def write_section_mark(self, pending, ack, ok):
         snapshot = pending["snapshot"]
         section = pending["new_section_info"]
+        profile = pending["new_profile_info"]
 
         row = {
             "wall_time": datetime.now().isoformat(timespec="milliseconds"),
@@ -680,6 +778,25 @@ class Dashboard(QtWidgets.QMainWindow):
             "profile_key": section.get("profile_key", ""),
             "section_role": section.get("role", ""),
             "section_note": section.get("note", ""),
+
+            "profile_label_ko": profile.get("label_ko", ""),
+            "profile_base_speed": profile.get("base_speed", ""),
+            "profile_curve_speed": profile.get("curve_speed", ""),
+            "profile_sharp_curve_speed": profile.get("sharp_curve_speed", ""),
+            "profile_min_run_speed": profile.get("min_run_speed", ""),
+            "profile_kp": profile.get("kp", ""),
+            "profile_kd": profile.get("kd", ""),
+            "profile_max_correction": profile.get("max_correction", ""),
+            "profile_reverse_allow": profile.get("reverse_allow", ""),
+            "profile_reverse_pwm_mid": profile.get("reverse_pwm_mid", ""),
+            "profile_reverse_pwm_high": profile.get("reverse_pwm_high", ""),
+            "profile_error_curve_threshold": profile.get("error_curve_threshold", ""),
+            "profile_error_sharp_threshold": profile.get("error_sharp_threshold", ""),
+            "profile_d_error_curve_threshold": profile.get("d_error_curve_threshold", ""),
+            "profile_d_error_sharp_threshold": profile.get("d_error_sharp_threshold", ""),
+            "profile_search_pwm": profile.get("search_pwm", ""),
+            "profile_line_loss_max_ms": profile.get("line_loss_max_ms", ""),
+
             "cmd_seq": ack.get("cmd_seq", ""),
             "ack": 1 if ok else 0,
             "status": ack.get("status_name", ""),
@@ -701,11 +818,15 @@ class Dashboard(QtWidgets.QMainWindow):
         self.section_csv_file.flush()
 
         print(
-            "section mark: {} -> {}  {} / {}  ack={} status={} rtt={}ms".format(
+            "section mark: {} -> {}  {} / {}  profile={} base={} kp={} kd={} ack={} status={} rtt={}ms".format(
                 row["old_section_id"],
                 row["new_section_id"],
                 row["section_label_ko"],
                 row["section_type"],
+                row["profile_key"],
+                row["profile_base_speed"],
+                row["profile_kp"],
+                row["profile_kd"],
                 row["ack"],
                 row["status"],
                 row["rtt_ms"],
@@ -765,10 +886,12 @@ class Dashboard(QtWidgets.QMainWindow):
         )
 
         section_status = self.current_section_text()
+        profile_status = self.current_profile_text()
 
         self.status_label.setText(
             "telemetry_listen={}:{}  packet_size={}  version={}  "
             "received={}  lost={} ({:.2f}%)  bad={}  last_age={}ms  bad_reason={}\n"
+            "{}\n"
             "{}\n"
             "{}\n"
             "{}\n"
@@ -787,6 +910,7 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.last_bad_reason,
                 command_status,
                 section_status,
+                profile_status,
                 command_help,
                 self.csv_path,
                 self.section_csv_path,
