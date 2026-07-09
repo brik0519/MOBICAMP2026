@@ -1,20 +1,16 @@
 # main.py
-# PAI-Car v1.0 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
+# PAI-Car v1.0 profile 기반 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
 #
 # 유지:
 #   - 엔코더 없는 모터 기준
-#   - error / d_error 기반 속도 제어
-#   - 라인 미검출 시 마지막 error 방향 저속 탐색
 #   - UDP 기본 V1 telemetry 포맷 유지
-#
-# 추가:
-#   - PC -> Pico UDP command 수신
-#   - PING / NEXT_SECTION / EMERGENCY_STOP / RUN 지원
-#   - Space는 트랙 구간 변경 marker로 사용하며 정지하지 않음
-#   - Z emergency stop 상태에서는 최종 모터 출력만 0으로 덮어씀
-#   - Z 정지 중에는 finish 판별과 lap timer update를 중단
-#   - Enter 재개 시 정지 시간만큼 주행 시간을 보정
 #   - 버튼 직후 시작선 중복 finish 오검출 방지
+#   - Z 긴급 정지 / Enter 재개
+#
+# 변경:
+#   - 고정 KP / KD / 속도값 대신 DriveProfileManager의 현재 section profile 사용
+#   - Space로 section 변경 시 Pico 내부 profile도 변경
+#   - section별 base_speed, curve_speed, kp, kd, max_correction, search_pwm 적용
 
 from time import ticks_ms, ticks_diff, ticks_add
 
@@ -32,44 +28,7 @@ from modules.pai_udp_telemetry import (
 )
 
 from modules.pai_udp_command import PAIUdpCommand
-
-
-# ------------------------------------------------------------
-# PD-control settings
-# ------------------------------------------------------------
-
-BASE_SPEED = 1000
-
-KP = 0.52
-KD = 0.21
-
-MAX_CORRECTION = 1100
-
-
-# ------------------------------------------------------------
-# Speed settings
-# ------------------------------------------------------------
-
-STRAIGHT_SPEED = 1000
-CURVE_SPEED = 830
-SHARP_CURVE_SPEED = 680
-
-MIN_RUN_SPEED = 500
-
-
-# ------------------------------------------------------------
-# Optional time-based slow zones
-# ------------------------------------------------------------
-
-TIME_SLOW_ZONES = []
-
-
-# ------------------------------------------------------------
-# Line-loss recovery settings
-# ------------------------------------------------------------
-
-SEARCH_PWM = 280
-LINE_LOSS_MAX_MS = 250
+from modules.pai_drive_profiles import DriveProfileManager
 
 
 # ------------------------------------------------------------
@@ -85,35 +44,6 @@ START_MARKER_RELEASE_COUNT = 5
 # ------------------------------------------------------------
 # Helper functions
 # ------------------------------------------------------------
-
-def clamp_correction(value):
-    if value > MAX_CORRECTION:
-        return MAX_CORRECTION
-
-    if value < -MAX_CORRECTION:
-        return -MAX_CORRECTION
-
-    return int(value)
-
-
-def limit_drive_cmd(value, error):
-    ae = abs(error)
-
-    if ae >= 2400:
-        min_cmd = -420
-    elif ae >= 1650:
-        min_cmd = -250
-    else:
-        min_cmd = 0
-
-    if value > 1000:
-        return 1000
-
-    if value < min_cmd:
-        return min_cmd
-
-    return int(value)
-
 
 def count_black_sensors(norm):
     count = 0
@@ -142,35 +72,6 @@ def arm_start_marker_if_needed(lap_timer, norm, on_line):
         return True
 
     return False
-
-
-def speed_from_time(elapsed_ms):
-    speed = STRAIGHT_SPEED
-
-    for start_ms, end_ms, zone_speed in TIME_SLOW_ZONES:
-        if start_ms <= elapsed_ms <= end_ms:
-            if zone_speed < speed:
-                speed = zone_speed
-
-    return speed
-
-
-def speed_from_error(base_speed, error, d_error):
-    ae = abs(error)
-    ad = abs(d_error)
-
-    speed = base_speed
-
-    if ae > 2400 or ad > 1700:
-        speed = min(speed, SHARP_CURVE_SPEED)
-
-    elif ae > 1350 or ad > 950:
-        speed = min(speed, CURVE_SPEED)
-
-    if speed < MIN_RUN_SPEED:
-        speed = MIN_RUN_SPEED
-
-    return speed
 
 
 def send_stop_packet(
@@ -220,6 +121,8 @@ telemetry.begin()
 cmd = PAIUdpCommand(require_heartbeat=False)
 cmd.begin()
 
+drive_profiles = DriveProfileManager()
+
 
 # ------------------------------------------------------------
 # Self calibration
@@ -236,6 +139,9 @@ wait_button_start(button, lap_timer)
 
 lap_timer.start()
 telemetry.reset_timer()
+
+drive_profiles.reset()
+print(drive_profiles.debug_text())
 
 run_start_ms = ticks_ms()
 
@@ -257,7 +163,7 @@ start_marker_release_count = 0
 
 
 # ------------------------------------------------------------
-# PD-control line tracing
+# Profile-based line tracing
 # ------------------------------------------------------------
 
 finished = False
@@ -269,7 +175,7 @@ d_error = 0
 
 was_on_line = False
 
-target_speed = BASE_SPEED
+target_speed = drive_profiles.get_base_speed()
 
 line_lost_start_ms = None
 
@@ -287,6 +193,13 @@ try:
 
         cmd.poll()
         force_stop = cmd.should_force_stop()
+
+        section_changed = drive_profiles.sync_section_id(
+            cmd.get_track_section_id()
+        )
+
+        if section_changed:
+            print(drive_profiles.debug_text())
 
         # --------------------------------------------------------
         # 0-1. Z emergency stop pause / Enter resume
@@ -318,6 +231,10 @@ try:
 
         elapsed_ms = ticks_diff(now_ms, run_start_ms)
 
+        # elapsed_ms는 현재 telemetry/log 분석용으로 유지한다.
+        # 실제 속도 결정은 section profile이 담당한다.
+        _ = elapsed_ms
+
         # --------------------------------------------------------
         # 1. 라인센서 읽기
         # --------------------------------------------------------
@@ -329,12 +246,6 @@ try:
         # --------------------------------------------------------
         # 2. Pause 상태
         # --------------------------------------------------------
-        #
-        # Z 긴급 정지 중에는:
-        #   - finish 판별 금지
-        #   - lap_timer.update 금지
-        #   - 모터 정지 유지
-        #   - telemetry는 계속 송신
 
         if paused:
             target_speed = 0
@@ -382,7 +293,7 @@ try:
                     break
 
             # ----------------------------------------------------
-            # 4. PD 제어 + 라인 미검출 복구
+            # 4. Profile 기반 PD 제어 + 라인 미검출 복구
             # ----------------------------------------------------
 
             if on_line:
@@ -396,23 +307,22 @@ try:
                 last_error = error
                 was_on_line = True
 
-                time_speed = speed_from_time(elapsed_ms)
-
-                target_speed = speed_from_error(
-                    time_speed,
+                target_speed = drive_profiles.compute_target_speed(
                     error,
                     d_error
                 )
 
-                correction = int(KP * error + KD * d_error)
-                correction = clamp_correction(correction)
+                correction = drive_profiles.compute_correction(
+                    error,
+                    d_error
+                )
 
-                left_cmd = limit_drive_cmd(
+                left_cmd = drive_profiles.limit_drive_cmd(
                     target_speed + correction,
                     error
                 )
 
-                right_cmd = limit_drive_cmd(
+                right_cmd = drive_profiles.limit_drive_cmd(
                     target_speed - correction,
                     error
                 )
@@ -431,13 +341,16 @@ try:
                 target_speed = 0
                 was_on_line = False
 
-                if loss_ms <= LINE_LOSS_MAX_MS:
+                search_pwm = drive_profiles.get_search_pwm()
+                line_loss_max_ms = drive_profiles.get_line_loss_max_ms()
+
+                if loss_ms <= line_loss_max_ms:
                     if last_error < 0:
-                        left_cmd = -SEARCH_PWM
-                        right_cmd = SEARCH_PWM
+                        left_cmd = -search_pwm
+                        right_cmd = search_pwm
                     else:
-                        left_cmd = SEARCH_PWM
-                        right_cmd = -SEARCH_PWM
+                        left_cmd = search_pwm
+                        right_cmd = -search_pwm
 
                     motors.drive(left_cmd, right_cmd)
 
