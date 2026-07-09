@@ -24,7 +24,6 @@ from modules.pai_car_run_support import (
     setup_paicar,
     self_calibrate_or_stop,
     wait_button_start,
-    limit_cmd,
     wait_control_period,
 )
 
@@ -203,9 +202,7 @@ def target_tick_speed_from_pwm(target_pwm):
 
 
 def encoder_speed_boost(encoders, target_pwm):
-    actual_tick_speed = (
-        encoders.left_speed + encoders.right_speed
-    ) // 2
+    actual_tick_speed = encoders.progress_speed
 
     target_tick_speed = target_tick_speed_from_pwm(target_pwm)
 
@@ -364,7 +361,14 @@ try:
                 if encoders.distance_ticks < MIN_FINISH_DISTANCE_TICKS:
                     finish_allowed = False
 
+
                 if finish_allowed:
+                    d_error = 0
+                    left_cmd = 0
+                    right_cmd = 0
+                    target_speed = 0
+
+                    encoders.set_direction_from_cmd(0, 0)
                     motors.stop()
                     finished = True
 
@@ -460,18 +464,17 @@ try:
                 error
             )
 
+            encoders.set_direction_from_cmd(left_cmd, right_cmd)
             motors.drive(left_cmd, right_cmd)
 
-            encoders.set_direction_from_cmd(left_cmd, right_cmd)
-
         else:
-            # 아직 마지막 오차 방향 저속 탐색은 넣지 않는다.
-            motors.stop()
             encoders.set_direction_from_cmd(0, 0)
+            motors.stop()
 
             d_error = 0
             left_cmd = 0
             right_cmd = 0
+            target_speed = 0
             was_on_line = False
 
         # --------------------------------------------------------
@@ -526,6 +529,7 @@ try:
 
 
 finally:
+    encoders.set_direction_from_cmd(0, 0)
     motors.stop()
     telemetry.close()
 

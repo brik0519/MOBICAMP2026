@@ -6,6 +6,7 @@
 #   2. packet을 unpack해서 CSV 파일로 저장한다.
 #   3. 하나의 figure에 3개의 subplot을 표시한다.
 #   4. PC에서 좌우 모터 명령 평균값을 계산해 평균 속도처럼 함께 plot한다.
+#   5. encoder distance / wheel speed / UDP timing 값을 CSV에 저장한다.
 #
 # subplot 구성:
 #   1) position
@@ -13,7 +14,7 @@
 #   3) left/right motor command + average speed
 #
 # 주의:
-#   Pico 쪽 pai_udp_telemetry.py의 PACKET_FORMAT과 반드시 같아야 한다.
+#   Pico 쪽 pai_udp_telemetry.py의 PACKET_FORMAT, VERSION과 반드시 같아야 한다.
 #
 # 실행:
 #   python pc_udp_monitor.py
@@ -48,7 +49,9 @@ RECV_BUFFER_SIZE = 2048
 # Pico 쪽 pai_udp_telemetry.py와 동일해야 한다.
 
 MAGIC = 0x5041
-VERSION = 1
+
+# 확장 UDP packet은 VERSION = 2
+VERSION = 2
 
 PACKET_FORMAT = "<HBBHIHHh8HHhhhhBBihhhhihhBB"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
@@ -109,15 +112,6 @@ MAX_POINTS = 1500       # 50Hz 기준 약 30초 표시
 PLOT_INTERVAL_MS = 100  # 그래프 갱신 간격
 
 # 현재 Pico 코드에서는 left_cmd/right_cmd가 이미 최종 모터 명령이다.
-#
-# False:
-#   세 번째 subplot에 left_cmd, right_cmd를 그대로 표시한다.
-#
-# True:
-#   세 번째 subplot에 base_speed + left_cmd,
-#   base_speed + right_cmd를 표시한다.
-#
-# 일반적으로는 False가 맞다.
 PLOT_LITERAL_BASE_PLUS_CMD = False
 
 
@@ -135,6 +129,11 @@ avg_speed_buf = deque(maxlen=MAX_POINTS)
 received_count = 0
 bad_packet_count = 0
 lost_packet_count = 0
+udp_overrun_count = 0
+
+max_udp_loop_ms = 0
+max_udp_send_cost_ms = 0
+
 last_seq = None
 
 closed = False
@@ -184,6 +183,16 @@ def parse_packet(data):
     on_line = values[21]
     is_marker = values[22]
 
+    distance_ticks = values[23]
+    left_speed = values[24]
+    right_speed = values[25]
+    dl = values[26]
+    dr = values[27]
+    heading_ticks = values[28]
+    udp_loop_ms = values[29]
+    udp_send_cost_ms = values[30]
+    udp_overrun = values[31]
+
     row = {
         "seq": seq,
         "t_ms": t_ms,
@@ -207,6 +216,16 @@ def parse_packet(data):
         "right_cmd": right_cmd,
         "on_line": on_line,
         "is_marker": is_marker,
+
+        "distance_ticks": distance_ticks,
+        "left_speed": left_speed,
+        "right_speed": right_speed,
+        "dl": dl,
+        "dr": dr,
+        "heading_ticks": heading_ticks,
+        "udp_loop_ms": udp_loop_ms,
+        "udp_send_cost_ms": udp_send_cost_ms,
+        "udp_overrun": udp_overrun,
     }
 
     return row
@@ -254,6 +273,7 @@ print()
 print("PAI-Car UDP binary monitor")
 print("Listening on {}:{}".format(LISTEN_IP, LISTEN_PORT))
 print("Expected packet size:", PACKET_SIZE)
+print("Expected packet version:", VERSION)
 print("CSV file:", CSV_FILENAME)
 print()
 
@@ -319,6 +339,9 @@ def receive_available_packets():
 
     global received_count
     global bad_packet_count
+    global udp_overrun_count
+    global max_udp_loop_ms
+    global max_udp_send_cost_ms
 
     while True:
         try:
@@ -339,6 +362,15 @@ def receive_available_packets():
         received_count += 1
         update_lost_packet_count(row["seq"])
 
+        if row["udp_overrun"]:
+            udp_overrun_count += 1
+
+        if row["udp_loop_ms"] > max_udp_loop_ms:
+            max_udp_loop_ms = row["udp_loop_ms"]
+
+        if row["udp_send_cost_ms"] > max_udp_send_cost_ms:
+            max_udp_send_cost_ms = row["udp_send_cost_ms"]
+
         write_csv_row(csv_writer, row)
 
         if received_count % FLUSH_EVERY_ROWS == 0:
@@ -353,8 +385,6 @@ def receive_available_packets():
             left_value = row["left_cmd"]
             right_value = row["right_cmd"]
 
-        # PC에서 데이터 기반으로 평균 속도 계산
-        # 실제 m/s가 아니라 좌우 모터 명령값의 평균이다.
         avg_speed = (left_value + right_value) / 2
 
         time_buf.append(t_sec)
@@ -391,11 +421,24 @@ def update_plot(frame):
         ax_motor.relim()
         ax_motor.autoscale_view(scalex=False, scaley=True)
 
+    if received_count > 0:
+        overrun_ratio = udp_overrun_count * 100.0 / received_count
+    else:
+        overrun_ratio = 0.0
+
     fig.suptitle(
-        "received: {}   lost: {}   bad: {}   csv: {}".format(
+        (
+            "received: {}   lost: {}   bad: {}   "
+            "udp_overrun: {} ({:.1f}%)   "
+            "max_loop: {}ms   max_send: {}ms   csv: {}"
+        ).format(
             received_count,
             lost_packet_count,
             bad_packet_count,
+            udp_overrun_count,
+            overrun_ratio,
+            max_udp_loop_ms,
+            max_udp_send_cost_ms,
             CSV_FILENAME
         )
     )
@@ -430,12 +473,20 @@ def close_resources():
     except Exception:
         pass
 
+    if received_count > 0:
+        overrun_ratio = udp_overrun_count * 100.0 / received_count
+    else:
+        overrun_ratio = 0.0
+
     print()
     print("Stopped.")
     print("CSV saved:", CSV_FILENAME)
     print("received:", received_count)
     print("lost:", lost_packet_count)
     print("bad:", bad_packet_count)
+    print("udp_overrun:", udp_overrun_count, "({:.1f}%)".format(overrun_ratio))
+    print("max_udp_loop_ms:", max_udp_loop_ms)
+    print("max_udp_send_cost_ms:", max_udp_send_cost_ms)
 
 
 def on_close(event):
