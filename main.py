@@ -1,10 +1,12 @@
 # main.py
 # PAI-Car stabilized PD controller
 # - center deadband and steering smoothing
+# - derivative deadband
 # - continuous curve-speed planner
 # - speed-dependent gain scheduling
+# - inner wheel floor during tracking
 # - staged line-loss recovery
-# - UDP telemetry/debug support
+# - UDP telemetry/debug skip on network lag
 
 from time import ticks_ms, ticks_diff
 import socket
@@ -39,7 +41,6 @@ from modules.pai_car_wifi_config import (
 
 DEBUG_MODE = True
 
-# 우선 10 ms에서 안정화한다.
 DEBUG_CONTROL_MS = 10
 RACE_CONTROL_MS = 10
 
@@ -61,31 +62,37 @@ DEBUG_REPORT_MS = 1000
 
 OVERRUN_THRESHOLD_MS = CONTROL_PERIOD_MS
 
+# 네트워크 전송이 이 시간 이상 걸리면 이후 일정 시간 송신을 건너뛴다.
+MAX_NETWORK_SEND_COST_MS = 2
+NETWORK_COOLDOWN_MS = 120
+
+# 제어 루프 계산이 이 값 이상 걸린 루프에서는 telemetry 샘플을 버린다.
+TELEMETRY_SKIP_COMPUTE_MS = 7
+
+# debug report가 밀리면 오래된 report를 보내지 않고 버린다.
+DEBUG_REPORT_MAX_LAG_MS = 1500
+
 
 # ============================================================
 # 3. Speed planner settings
 # ============================================================
 
-# 코스 대부분이 곡선이므로 최고속보다 안정적인 평균속도를 우선한다.
-MAX_TRACK_SPEED = 580
-MEDIUM_CURVE_SPEED = 430
-SHARP_CURVE_SPEED = 280
+MAX_TRACK_SPEED = 560
+MEDIUM_CURVE_SPEED = 400
+SHARP_CURVE_SPEED = 270
 VERY_SHARP_SPEED = 220
-LOW_CONFIDENCE_SPEED = 230
+LOW_CONFIDENCE_SPEED = 220
 
-# 라인 복구용 출력
 RECOVERY_FORWARD_SPEED = 180
 RECOVERY_TURN_SPEED = 330
 RECOVERY_PIVOT_SPEED = 260
 
-# 속도 변화율
-SPEED_RISE_STEP = 5
-SPEED_FALL_STEP = 35
+SPEED_RISE_STEP = 4
+SPEED_FALL_STEP = 55
 
-# 곡선 위험도 경계
-CURVE_SCORE_MEDIUM = 0.22
-CURVE_SCORE_SHARP = 0.46
-CURVE_SCORE_VERY_SHARP = 0.72
+CURVE_SCORE_MEDIUM = 0.16
+CURVE_SCORE_SHARP = 0.40
+CURVE_SCORE_VERY_SHARP = 0.68
 
 LOW_CONFIDENCE_THRESHOLD = 0.30
 
@@ -102,25 +109,25 @@ CURVE_ACCEL_WEIGHT = 0.10
 # 4. PD controller settings
 # ============================================================
 
-# 중앙 부근에서는 낮은 Kp와 높은 Kd로 좌우 진동을 억제한다.
 KP_STRAIGHT = 0.20
-KP_CURVE = 0.28
-KP_SHARP = 0.36
+KP_CURVE = 0.26
+KP_SHARP = 0.32
 
-KD_STRAIGHT = 0.85
-KD_CURVE = 0.75
-KD_SHARP = 0.55
+KD_STRAIGHT = 0.65
+KD_CURVE = 0.60
+KD_SHARP = 0.45
 
-# 중앙 근처의 작은 센서 오차는 조향에 반영하지 않는다.
-ERROR_DEADBAND = 90.0
+ERROR_DEADBAND = 100.0
 
-# 상태별 최대 조향량
-MAX_STEERING_STRAIGHT = 300
-MAX_STEERING_CURVE = 430
-MAX_STEERING_SHARP = 560
+# 중앙 근처에서는 D항도 죽인다.
+D_ERROR_DEADBAND = 120.0
+D_RATE_DEADBAND = 45.0
 
-# 조향 명령 자체를 평활한다.
-STEERING_FILTER_ALPHA = 0.35
+MAX_STEERING_STRAIGHT = 260
+MAX_STEERING_CURVE = 380
+MAX_STEERING_SHARP = 470
+
+STEERING_FILTER_ALPHA = 0.30
 
 
 # ============================================================
@@ -138,8 +145,8 @@ EDGE_SENSOR_COUNT = 2
 # 6. Filter settings
 # ============================================================
 
-ERROR_FILTER_ALPHA = 0.50
-DERIVATIVE_FILTER_ALPHA = 0.22
+ERROR_FILTER_ALPHA = 0.45
+DERIVATIVE_FILTER_ALPHA = 0.12
 
 
 # ============================================================
@@ -158,6 +165,9 @@ MOTOR_RISE_STEP = 60
 MOTOR_FALL_STEP = 160
 
 ALLOW_REVERSE_TRACKING = False
+
+# 라인 추종 중 안쪽 바퀴가 0에 붙어 피벗처럼 도는 것을 막는다.
+INNER_MIN_TRACKING_CMD = 90
 
 
 # ============================================================
@@ -185,7 +195,15 @@ SPEED_STATE_RECOVERY = 5
 
 
 # ============================================================
-# 9. Common helpers
+# 9. Finish marker guard
+# ============================================================
+
+MIN_FINISH_MS = 1500
+FINISH_CONFIRM_COUNT = 2
+
+
+# ============================================================
+# 10. Common helpers
 # ============================================================
 
 def clamp(value, minimum, maximum):
@@ -239,7 +257,7 @@ def read_sensor_data(line):
 
 
 # ============================================================
-# 10. Sensor feature extraction
+# 11. Sensor feature extraction
 # ============================================================
 
 def calculate_line_width(norm):
@@ -275,10 +293,7 @@ def extract_features(
             active_count += 1
 
     if SENSOR_SUM_FULL > 0:
-        confidence = (
-            sensor_sum
-            / SENSOR_SUM_FULL
-        )
+        confidence = sensor_sum / SENSOR_SUM_FULL
     else:
         confidence = 0.0
 
@@ -301,15 +316,9 @@ def extract_features(
             )
         )
     else:
-        filtered_error = (
-            previous_filtered_error
-        )
+        filtered_error = previous_filtered_error
 
-    # 10 ms 제어 기준 변화량으로 환산한다.
-    period_scale = (
-        10.0
-        / CONTROL_PERIOD_MS
-    )
+    period_scale = 10.0 / CONTROL_PERIOD_MS
 
     if on_line:
         raw_rate = (
@@ -338,38 +347,23 @@ def extract_features(
 
     sensor_count = len(norm)
 
-    for index in range(
-        EDGE_SENSOR_COUNT
-    ):
+    for index in range(EDGE_SENSOR_COUNT):
         if index < sensor_count:
             edge_left += norm[index]
 
-        right_index = (
-            sensor_count
-            - 1
-            - index
-        )
+        right_index = sensor_count - 1 - index
 
         if right_index >= 0:
-            edge_right += norm[
-                right_index
-            ]
+            edge_right += norm[right_index]
 
-    line_width = calculate_line_width(
-        norm
-    )
+    line_width = calculate_line_width(norm)
 
-    wide_line = (
-        active_count
-        >= WIDE_LINE_COUNT
-    )
+    wide_line = active_count >= WIDE_LINE_COUNT
 
     return {
         "error": error,
         "filtered_error": filtered_error,
-        "filtered_error_rate": (
-            filtered_error_rate
-        ),
+        "filtered_error_rate": filtered_error_rate,
         "error_accel": error_accel,
         "sensor_sum": sensor_sum,
         "confidence": confidence,
@@ -398,38 +392,26 @@ def create_empty_features():
 
 
 # ============================================================
-# 11. Curve score and speed planner
+# 12. Curve score and speed planner
 # ============================================================
 
 def calculate_curve_score(features):
     error_component = clamp(
-        abs(
-            features[
-                "filtered_error"
-            ]
-        )
+        abs(features["filtered_error"])
         / CURVE_ERROR_REFERENCE,
         0.0,
         1.0,
     )
 
     rate_component = clamp(
-        abs(
-            features[
-                "filtered_error_rate"
-            ]
-        )
+        abs(features["filtered_error_rate"])
         / CURVE_RATE_REFERENCE,
         0.0,
         1.0,
     )
 
     accel_component = clamp(
-        abs(
-            features[
-                "error_accel"
-            ]
-        )
+        abs(features["error_accel"])
         / CURVE_ACCEL_REFERENCE,
         0.0,
         1.0,
@@ -462,37 +444,25 @@ def calculate_target_speed(
             SPEED_STATE_RECOVERY,
         )
 
-    if (
-        features["confidence"]
-        < LOW_CONFIDENCE_THRESHOLD
-    ):
+    if features["confidence"] < LOW_CONFIDENCE_THRESHOLD:
         return (
             LOW_CONFIDENCE_SPEED,
             SPEED_STATE_LOW_CONFIDENCE,
         )
 
-    if (
-        curve_score
-        >= CURVE_SCORE_VERY_SHARP
-    ):
+    if curve_score >= CURVE_SCORE_VERY_SHARP:
         return (
             VERY_SHARP_SPEED,
             SPEED_STATE_VERY_SHARP,
         )
 
-    if (
-        curve_score
-        >= CURVE_SCORE_SHARP
-    ):
+    if curve_score >= CURVE_SCORE_SHARP:
         return (
             SHARP_CURVE_SPEED,
             SPEED_STATE_SHARP,
         )
 
-    if (
-        curve_score
-        >= CURVE_SCORE_MEDIUM
-    ):
+    if curve_score >= CURVE_SCORE_MEDIUM:
         return (
             MEDIUM_CURVE_SPEED,
             SPEED_STATE_CURVE,
@@ -504,63 +474,38 @@ def calculate_target_speed(
     )
 
 
-def get_speed_state_name(
-    speed_state
-):
-    if (
-        speed_state
-        == SPEED_STATE_FAST
-    ):
+def get_speed_state_name(speed_state):
+    if speed_state == SPEED_STATE_FAST:
         return "FAST"
 
-    if (
-        speed_state
-        == SPEED_STATE_CURVE
-    ):
+    if speed_state == SPEED_STATE_CURVE:
         return "CURVE"
 
-    if (
-        speed_state
-        == SPEED_STATE_SHARP
-    ):
+    if speed_state == SPEED_STATE_SHARP:
         return "SHARP"
 
-    if (
-        speed_state
-        == SPEED_STATE_VERY_SHARP
-    ):
+    if speed_state == SPEED_STATE_VERY_SHARP:
         return "VSHARP"
 
-    if (
-        speed_state
-        == SPEED_STATE_LOW_CONFIDENCE
-    ):
+    if speed_state == SPEED_STATE_LOW_CONFIDENCE:
         return "LOWCONF"
 
     return "RECOVERY"
 
 
 # ============================================================
-# 12. Gain scheduling and steering
+# 13. Gain scheduling and steering
 # ============================================================
 
-def get_control_gains(
-    curve_score
-):
-    if (
-        curve_score
-        >= CURVE_SCORE_SHARP
-    ):
+def get_control_gains(curve_score):
+    if curve_score >= CURVE_SCORE_SHARP:
         return (
             KP_SHARP,
             KD_SHARP,
             MAX_STEERING_SHARP,
         )
 
-    if (
-        curve_score
-        >= CURVE_SCORE_MEDIUM
-    ):
+    if curve_score >= CURVE_SCORE_MEDIUM:
         return (
             KP_CURVE,
             KD_CURVE,
@@ -575,22 +520,23 @@ def get_control_gains(
 
 
 def apply_error_deadband(error):
-    if (
-        abs(error)
-        <= ERROR_DEADBAND
-    ):
+    if abs(error) <= ERROR_DEADBAND:
         return 0.0
 
     if error > 0:
-        return (
-            error
-            - ERROR_DEADBAND
-        )
+        return error - ERROR_DEADBAND
 
-    return (
-        error
-        + ERROR_DEADBAND
-    )
+    return error + ERROR_DEADBAND
+
+
+def apply_derivative_deadband(error, rate):
+    if (
+        abs(error) < D_ERROR_DEADBAND
+        and abs(rate) < D_RATE_DEADBAND
+    ):
+        return 0.0
+
+    return rate
 
 
 def calculate_steering(
@@ -602,29 +548,19 @@ def calculate_steering(
         kp,
         kd,
         max_steering,
-    ) = get_control_gains(
-        curve_score
+    ) = get_control_gains(curve_score)
+
+    control_error = apply_error_deadband(
+        features["filtered_error"]
     )
 
-    control_error = (
-        apply_error_deadband(
-            features[
-                "filtered_error"
-            ]
-        )
+    control_rate = apply_derivative_deadband(
+        features["filtered_error"],
+        features["filtered_error_rate"],
     )
 
-    p_term = (
-        kp
-        * control_error
-    )
-
-    d_term = (
-        kd
-        * features[
-            "filtered_error_rate"
-        ]
-    )
+    p_term = kp * control_error
+    d_term = kd * control_rate
 
     raw_steering = clamp(
         p_term + d_term,
@@ -651,7 +587,7 @@ def calculate_steering(
 
 
 # ============================================================
-# 13. Motor mixer
+# 14. Motor mixer
 # ============================================================
 
 def apply_motor_deadzone(
@@ -681,9 +617,7 @@ def apply_motor_deadzone(
     )
 
     if command < 0:
-        return (
-            -corrected_magnitude
-        )
+        return -corrected_magnitude
 
     return corrected_magnitude
 
@@ -704,10 +638,7 @@ def preserve_ratio_saturation(
             1.0,
         )
 
-    scale = (
-        MOTOR_MAX_CMD
-        / peak
-    )
+    scale = MOTOR_MAX_CMD / peak
 
     return (
         left_cmd * scale,
@@ -722,32 +653,50 @@ def slew_limit(
     rise_step,
     fall_step,
 ):
-    delta = (
-        target_cmd
-        - previous_cmd
-    )
+    delta = target_cmd - previous_cmd
 
-    if (
-        abs(target_cmd)
-        > abs(previous_cmd)
-    ):
+    if abs(target_cmd) > abs(previous_cmd):
         step_limit = rise_step
     else:
         step_limit = fall_step
 
     if delta > step_limit:
-        return (
-            previous_cmd
-            + step_limit
-        )
+        return previous_cmd + step_limit
 
     if delta < -step_limit:
-        return (
-            previous_cmd
-            - step_limit
-        )
+        return previous_cmd - step_limit
 
     return target_cmd
+
+
+def apply_inner_wheel_floor(
+    left_cmd,
+    right_cmd,
+    base_speed,
+    tracking=True,
+):
+    if not tracking:
+        return (
+            left_cmd,
+            right_cmd,
+        )
+
+    if base_speed <= 0:
+        return (
+            left_cmd,
+            right_cmd,
+        )
+
+    if 0 < left_cmd < INNER_MIN_TRACKING_CMD:
+        left_cmd = INNER_MIN_TRACKING_CMD
+
+    if 0 < right_cmd < INNER_MIN_TRACKING_CMD:
+        right_cmd = INNER_MIN_TRACKING_CMD
+
+    return (
+        left_cmd,
+        right_cmd,
+    )
 
 
 def mix_motor_commands(
@@ -757,15 +706,8 @@ def mix_motor_commands(
     previous_right_cmd,
     emergency=False,
 ):
-    left_cmd = (
-        base_speed
-        + steering
-    )
-
-    right_cmd = (
-        base_speed
-        - steering
-    )
+    left_cmd = base_speed + steering
+    right_cmd = base_speed - steering
 
     if not ALLOW_REVERSE_TRACKING:
         if left_cmd < 0:
@@ -773,6 +715,16 @@ def mix_motor_commands(
 
         if right_cmd < 0:
             right_cmd = 0
+
+    (
+        left_cmd,
+        right_cmd,
+    ) = apply_inner_wheel_floor(
+        left_cmd,
+        right_cmd,
+        base_speed,
+        tracking=True,
+    )
 
     left_cmd *= LEFT_GAIN
     right_cmd *= RIGHT_GAIN
@@ -797,36 +749,24 @@ def mix_motor_commands(
     )
 
     if not emergency:
-        period_scale = (
-            CONTROL_PERIOD_MS
-            / 10.0
-        )
+        period_scale = CONTROL_PERIOD_MS / 10.0
 
         left_cmd = slew_limit(
             left_cmd,
             previous_left_cmd,
-            MOTOR_RISE_STEP
-            * period_scale,
-            MOTOR_FALL_STEP
-            * period_scale,
+            MOTOR_RISE_STEP * period_scale,
+            MOTOR_FALL_STEP * period_scale,
         )
 
         right_cmd = slew_limit(
             right_cmd,
             previous_right_cmd,
-            MOTOR_RISE_STEP
-            * period_scale,
-            MOTOR_FALL_STEP
-            * period_scale,
+            MOTOR_RISE_STEP * period_scale,
+            MOTOR_FALL_STEP * period_scale,
         )
 
-    left_cmd = limit_cmd(
-        int(left_cmd)
-    )
-
-    right_cmd = limit_cmd(
-        int(right_cmd)
-    )
+    left_cmd = limit_cmd(int(left_cmd))
+    right_cmd = limit_cmd(int(right_cmd))
 
     return (
         left_cmd,
@@ -836,7 +776,7 @@ def mix_motor_commands(
 
 
 # ============================================================
-# 14. Line-loss recovery controller
+# 15. Line-loss recovery controller
 # ============================================================
 
 def calculate_recovery_commands(
@@ -845,22 +785,14 @@ def calculate_recovery_commands(
     previous_left_cmd,
     previous_right_cmd,
 ):
-    # 1~2프레임 미검출은 순간적인 센서 누락으로 간주한다.
-    if (
-        lost_elapsed_ms
-        <= LOST_GRACE_MS
-    ):
+    if lost_elapsed_ms <= LOST_GRACE_MS:
         return (
             STATE_LOST_GRACE,
             previous_left_cmd,
             previous_right_cmd,
         )
 
-    # 마지막으로 라인이 보였던 방향으로 완만하게 회전한다.
-    if (
-        lost_elapsed_ms
-        <= SOFT_SEARCH_MS
-    ):
+    if lost_elapsed_ms <= SOFT_SEARCH_MS:
         if last_valid_error < 0:
             return (
                 STATE_SOFT_SEARCH,
@@ -874,7 +806,6 @@ def calculate_recovery_commands(
             RECOVERY_FORWARD_SPEED,
         )
 
-    # 장기 미검출에서는 한쪽 바퀴를 정지하여 더 강하게 회전한다.
     if last_valid_error < 0:
         return (
             STATE_HARD_SEARCH,
@@ -890,7 +821,7 @@ def calculate_recovery_commands(
 
 
 # ============================================================
-# 15. Wireless debug UDP
+# 16. Wireless debug UDP
 # ============================================================
 
 def create_debug_socket():
@@ -904,9 +835,7 @@ def create_debug_socket():
         )
 
         try:
-            debug_socket.setblocking(
-                False
-            )
+            debug_socket.setblocking(False)
         except Exception:
             pass
 
@@ -921,7 +850,12 @@ def send_debug_message(
     message,
 ):
     if debug_socket is None:
-        return False
+        return (
+            False,
+            0,
+        )
+
+    start_ms = ticks_ms()
 
     try:
         debug_socket.sendto(
@@ -932,10 +866,26 @@ def send_debug_message(
             ),
         )
 
-        return True
+        cost_ms = ticks_diff(
+            ticks_ms(),
+            start_ms,
+        )
+
+        return (
+            True,
+            cost_ms,
+        )
 
     except OSError:
-        return False
+        cost_ms = ticks_diff(
+            ticks_ms(),
+            start_ms,
+        )
+
+        return (
+            False,
+            cost_ms,
+        )
 
 
 def send_debug_report(
@@ -960,7 +910,10 @@ def send_debug_report(
     right_cmd,
 ):
     if debug_socket is None:
-        return
+        return (
+            False,
+            0,
+        )
 
     message = (
         "type=status,"
@@ -990,21 +943,15 @@ def send_debug_report(
     ).format(
         loop_count,
         drive_state,
-        get_speed_state_name(
-            speed_state
-        ),
+        get_speed_state_name(speed_state),
         target_speed,
         current_speed,
         last_loop_ms,
         max_loop_ms,
         overrun_count,
         features["error"],
-        features[
-            "filtered_error"
-        ],
-        features[
-            "filtered_error_rate"
-        ],
+        features["filtered_error"],
+        features["filtered_error_rate"],
         features["confidence"],
         features["active_count"],
         features["wide_line"],
@@ -1019,7 +966,7 @@ def send_debug_report(
         right_cmd,
     )
 
-    send_debug_message(
+    return send_debug_message(
         debug_socket,
         message,
     )
@@ -1033,21 +980,17 @@ def send_final_report(
     max_loop_ms,
     total_compute_ms,
     line_lost_count,
+    telemetry_sent_count,
+    telemetry_skip_count,
+    debug_skip_count,
+    network_slow_count,
 ):
     if debug_socket is None:
         return
 
     if loop_count > 0:
-        average_compute_ms = (
-            total_compute_ms
-            / loop_count
-        )
-
-        overrun_rate = (
-            overrun_count
-            * 100.0
-            / loop_count
-        )
+        average_compute_ms = total_compute_ms / loop_count
+        overrun_rate = overrun_count * 100.0 / loop_count
     else:
         average_compute_ms = 0.0
         overrun_rate = 0.0
@@ -1062,14 +1005,14 @@ def send_final_report(
         "max_compute_ms={},"
         "overrun_count={},"
         "overrun_rate={:.2f},"
-        "line_lost_entry={}"
+        "line_lost_entry={},"
+        "telemetry_sent={},"
+        "telemetry_skip={},"
+        "debug_skip={},"
+        "network_slow={}"
     ).format(
         finished,
-        (
-            "DEBUG"
-            if DEBUG_MODE
-            else "RACE"
-        ),
+        "DEBUG" if DEBUG_MODE else "RACE",
         CONTROL_PERIOD_MS,
         loop_count,
         average_compute_ms,
@@ -1077,6 +1020,10 @@ def send_final_report(
         overrun_count,
         overrun_rate,
         line_lost_count,
+        telemetry_sent_count,
+        telemetry_skip_count,
+        debug_skip_count,
+        network_slow_count,
     )
 
     send_debug_message(
@@ -1086,7 +1033,7 @@ def send_final_report(
 
 
 # ============================================================
-# 16. OLED
+# 17. OLED
 # ============================================================
 
 def show_running_mode(lap_timer):
@@ -1098,9 +1045,7 @@ def show_running_mode(lap_timer):
     try:
         lap_timer.show(
             mode_name,
-            "{} ms".format(
-                CONTROL_PERIOD_MS
-            ),
+            "{} ms".format(CONTROL_PERIOD_MS),
             "Stable PD",
             "",
         )
@@ -1109,7 +1054,7 @@ def show_running_mode(lap_timer):
 
 
 # ============================================================
-# 17. Main
+# 18. Main
 # ============================================================
 
 def run():
@@ -1130,6 +1075,13 @@ def run():
 
     line_lost_count = 0
 
+    telemetry_sent_count = 0
+    telemetry_skip_count = 0
+    debug_skip_count = 0
+    network_slow_count = 0
+
+    network_cooldown_until_ms = 0
+
     try:
         lap_timer = create_lap_timer()
 
@@ -1137,22 +1089,25 @@ def run():
             line,
             motors,
             button,
-        ) = setup_paicar(
-            lap_timer
-        )
+        ) = setup_paicar(lap_timer)
 
         if DEBUG_MODE:
-            telemetry = PAIUdpTelemetry(
-                lap_timer
-            )
-
+            telemetry = PAIUdpTelemetry(lap_timer)
             telemetry.begin()
 
-            debug_socket = (
-                create_debug_socket()
-            )
+            # pai_udp_telemetry.py가 blocking socket이면 여기서 가능한 경우 non-blocking 처리한다.
+            try:
+                if telemetry.sock is not None:
+                    telemetry.sock.setblocking(False)
+            except Exception:
+                pass
 
-            send_debug_message(
+            debug_socket = create_debug_socket()
+
+            (
+                ok,
+                cost_ms,
+            ) = send_debug_message(
                 debug_socket,
                 (
                     "type=boot,"
@@ -1168,15 +1123,20 @@ def run():
                 ),
             )
 
+            if cost_ms > MAX_NETWORK_SEND_COST_MS:
+                network_slow_count += 1
+                network_cooldown_until_ms = (
+                    ticks_ms()
+                    + NETWORK_COOLDOWN_MS
+                )
+
         self_calibrate_or_stop(
             line,
             motors,
             lap_timer,
         )
 
-        show_running_mode(
-            lap_timer
-        )
+        show_running_mode(lap_timer)
 
         wait_button_start(
             button,
@@ -1184,6 +1144,8 @@ def run():
         )
 
         lap_timer.start()
+
+        run_start_ms = ticks_ms()
 
         if telemetry is not None:
             telemetry.reset_timer()
@@ -1193,9 +1155,7 @@ def run():
             "type=start",
         )
 
-        features = (
-            create_empty_features()
-        )
+        features = create_empty_features()
 
         previous_filtered_error = 0.0
         previous_filtered_derivative = 0.0
@@ -1204,23 +1164,12 @@ def run():
         previous_right_cmd = 0
         previous_steering = 0
 
-        current_speed = (
-            VERY_SHARP_SPEED
-        )
-
-        target_speed = (
-            VERY_SHARP_SPEED
-        )
+        current_speed = VERY_SHARP_SPEED
+        target_speed = VERY_SHARP_SPEED
 
         curve_score = 0.0
-
-        speed_state = (
-            SPEED_STATE_VERY_SHARP
-        )
-
-        drive_state = (
-            STATE_TRACKING
-        )
+        speed_state = SPEED_STATE_VERY_SHARP
+        drive_state = STATE_TRACKING
 
         p_term = 0.0
         d_term = 0.0
@@ -1241,9 +1190,9 @@ def run():
 
         previous_on_line = True
 
-        last_debug_report_ms = (
-            ticks_ms()
-        )
+        last_debug_report_ms = ticks_ms()
+
+        finish_confirm_count = 0
 
         while True:
             loop_start = ticks_ms()
@@ -1256,9 +1205,7 @@ def run():
                 norm,
                 on_line,
                 is_marker,
-            ) = read_sensor_data(
-                line
-            )
+            ) = read_sensor_data(line)
 
             features = extract_features(
                 error,
@@ -1268,23 +1215,10 @@ def run():
                 previous_filtered_derivative,
             )
 
-            previous_filtered_error = (
-                features[
-                    "filtered_error"
-                ]
-            )
+            previous_filtered_error = features["filtered_error"]
+            previous_filtered_derivative = features["filtered_error_rate"]
 
-            previous_filtered_derivative = (
-                features[
-                    "filtered_error_rate"
-                ]
-            )
-
-            curve_score = (
-                calculate_curve_score(
-                    features
-                )
-            )
+            curve_score = calculate_curve_score(features)
 
             (
                 target_speed,
@@ -1295,10 +1229,23 @@ def run():
                 on_line,
             )
 
-            if lap_timer.check_finish(
-                norm,
-                on_line,
-            ):
+            elapsed_run_ms = ticks_diff(
+                ticks_ms(),
+                run_start_ms,
+            )
+
+            if elapsed_run_ms >= MIN_FINISH_MS:
+                if lap_timer.check_finish(
+                    norm,
+                    on_line,
+                ):
+                    finish_confirm_count += 1
+                else:
+                    finish_confirm_count = 0
+            else:
+                finish_confirm_count = 0
+
+            if finish_confirm_count >= FINISH_CONFIRM_COUNT:
                 motors.stop()
 
                 left_cmd = 0
@@ -1310,19 +1257,36 @@ def run():
                 finished = True
 
                 if telemetry is not None:
-                    telemetry.send_now(
-                        current_speed,
-                        norm,
-                        position,
-                        error,
-                        0,
-                        0,
-                        0,
-                        on_line,
-                        is_marker,
-                    )
+                    try:
+                        now = ticks_ms()
 
-                send_debug_message(
+                        if ticks_diff(
+                            now,
+                            network_cooldown_until_ms,
+                        ) >= 0:
+                            telemetry.send_now(
+                                current_speed,
+                                norm,
+                                position,
+                                error,
+                                0,
+                                0,
+                                0,
+                                on_line,
+                                is_marker,
+                            )
+
+                            telemetry_sent_count += 1
+                        else:
+                            telemetry_skip_count += 1
+
+                    except Exception:
+                        telemetry_skip_count += 1
+
+                (
+                    ok,
+                    cost_ms,
+                ) = send_debug_message(
                     debug_socket,
                     (
                         "type=finish,"
@@ -1338,48 +1302,36 @@ def run():
                     ),
                 )
 
+                if cost_ms > MAX_NETWORK_SEND_COST_MS:
+                    network_slow_count += 1
+
                 break
 
             if on_line:
-                last_valid_error = (
-                    features[
-                        "filtered_error"
-                    ]
-                )
+                last_valid_error = features["filtered_error"]
 
                 if not previous_on_line:
-                    reacquire_start_ms = (
-                        ticks_ms()
-                    )
+                    reacquire_start_ms = ticks_ms()
 
                 lost_start_ms = None
 
                 if (
-                    reacquire_start_ms
-                    is not None
+                    reacquire_start_ms is not None
                     and ticks_diff(
                         ticks_ms(),
                         reacquire_start_ms,
                     ) < REACQUIRE_MS
                 ):
-                    drive_state = (
-                        STATE_REACQUIRE
-                    )
+                    drive_state = STATE_REACQUIRE
 
                     target_speed = min(
                         target_speed,
                         SHARP_CURVE_SPEED,
                     )
                 else:
-                    drive_state = (
-                        STATE_TRACKING
-                    )
+                    drive_state = STATE_TRACKING
+                    reacquire_start_ms = None
 
-                    reacquire_start_ms = (
-                        None
-                    )
-
-                # T 마커나 넓은 선에서는 직전 조향을 천천히 감소시킨다.
                 if features["wide_line"]:
                     steering = int(
                         previous_steering
@@ -1410,10 +1362,8 @@ def run():
                     SPEED_FALL_STEP,
                 )
 
-                emergency = (
-                    speed_state
-                    == SPEED_STATE_VERY_SHARP
-                )
+                # 직각 코너가 없는 트랙이므로 라인 추종 중 emergency 피벗을 사용하지 않는다.
+                emergency = False
 
                 (
                     left_cmd,
@@ -1432,22 +1382,15 @@ def run():
                     right_cmd,
                 )
 
-                previous_steering = (
-                    steering
-                )
+                previous_steering = steering
 
             else:
                 if previous_on_line:
                     line_lost_count += 1
-
-                    lost_start_ms = (
-                        ticks_ms()
-                    )
+                    lost_start_ms = ticks_ms()
 
                 if lost_start_ms is None:
-                    lost_start_ms = (
-                        ticks_ms()
-                    )
+                    lost_start_ms = ticks_ms()
 
                 lost_elapsed_ms = ticks_diff(
                     ticks_ms(),
@@ -1465,17 +1408,9 @@ def run():
                     previous_right_cmd,
                 )
 
-                target_speed = (
-                    RECOVERY_FORWARD_SPEED
-                )
-
-                current_speed = (
-                    RECOVERY_FORWARD_SPEED
-                )
-
-                speed_state = (
-                    SPEED_STATE_RECOVERY
-                )
+                target_speed = RECOVERY_FORWARD_SPEED
+                current_speed = RECOVERY_FORWARD_SPEED
+                speed_state = SPEED_STATE_RECOVERY
 
                 steering = 0
                 p_term = 0.0
@@ -1495,22 +1430,58 @@ def run():
             previous_left_cmd = left_cmd
             previous_right_cmd = right_cmd
 
+            compute_mid = ticks_ms()
+            compute_before_network_ms = ticks_diff(
+                compute_mid,
+                loop_start,
+            )
+
+            # telemetry는 제어보다 우선순위가 낮다.
+            # 계산이 이미 오래 걸렸거나 네트워크 cooldown 중이면 해당 샘플을 삭제한다.
             if telemetry is not None:
-                telemetry.send_if_due(
-                    current_speed,
-                    norm,
-                    position,
-                    error,
-                    int(
-                        features[
-                            "filtered_error_rate"
-                        ]
-                    ),
-                    left_cmd,
-                    right_cmd,
-                    on_line,
-                    is_marker,
-                )
+                now = ticks_ms()
+
+                if compute_before_network_ms >= TELEMETRY_SKIP_COMPUTE_MS:
+                    telemetry_skip_count += 1
+
+                elif ticks_diff(
+                    now,
+                    network_cooldown_until_ms,
+                ) < 0:
+                    telemetry_skip_count += 1
+
+                else:
+                    send_start = ticks_ms()
+
+                    try:
+                        telemetry.send_if_due(
+                            current_speed,
+                            norm,
+                            position,
+                            error,
+                            int(features["filtered_error_rate"]),
+                            left_cmd,
+                            right_cmd,
+                            on_line,
+                            is_marker,
+                        )
+
+                        telemetry_sent_count += 1
+
+                    except Exception:
+                        telemetry_skip_count += 1
+
+                    send_cost_ms = ticks_diff(
+                        ticks_ms(),
+                        send_start,
+                    )
+
+                    if send_cost_ms > MAX_NETWORK_SEND_COST_MS:
+                        network_slow_count += 1
+                        network_cooldown_until_ms = (
+                            ticks_ms()
+                            + NETWORK_COOLDOWN_MS
+                        )
 
             lap_timer.update()
 
@@ -1521,61 +1492,70 @@ def run():
                 loop_start,
             )
 
-            total_compute_ms += (
-                last_loop_ms
-            )
+            total_compute_ms += last_loop_ms
 
-            if (
-                last_loop_ms
-                > max_loop_ms
-            ):
-                max_loop_ms = (
-                    last_loop_ms
-                )
+            if last_loop_ms > max_loop_ms:
+                max_loop_ms = last_loop_ms
 
-            if (
-                last_loop_ms
-                >= OVERRUN_THRESHOLD_MS
-            ):
+            if last_loop_ms >= OVERRUN_THRESHOLD_MS:
                 overrun_count += 1
 
             if DEBUG_MODE:
                 now = ticks_ms()
-
-                if ticks_diff(
+                debug_elapsed_ms = ticks_diff(
                     now,
                     last_debug_report_ms,
-                ) >= DEBUG_REPORT_MS:
+                )
 
-                    send_debug_report(
-                        debug_socket,
-                        loop_count,
-                        overrun_count,
-                        max_loop_ms,
-                        last_loop_ms,
-                        drive_state,
-                        features,
-                        target_speed,
-                        current_speed,
-                        speed_state,
-                        curve_score,
-                        steering,
-                        p_term,
-                        d_term,
-                        kp,
-                        kd,
-                        saturation_scale,
-                        left_cmd,
-                        right_cmd,
-                    )
+                if debug_elapsed_ms >= DEBUG_REPORT_MS:
+                    if debug_elapsed_ms > DEBUG_REPORT_MAX_LAG_MS:
+                        # 오래 밀린 debug report는 보내지 않고 버린다.
+                        debug_skip_count += 1
+                        last_debug_report_ms = now
 
-                    last_debug_report_ms = (
-                        now
-                    )
+                    elif ticks_diff(
+                        now,
+                        network_cooldown_until_ms,
+                    ) < 0:
+                        debug_skip_count += 1
+                        last_debug_report_ms = now
 
-            wait_control_period(
-                loop_start
-            )
+                    else:
+                        (
+                            ok,
+                            cost_ms,
+                        ) = send_debug_report(
+                            debug_socket,
+                            loop_count,
+                            overrun_count,
+                            max_loop_ms,
+                            last_loop_ms,
+                            drive_state,
+                            features,
+                            target_speed,
+                            current_speed,
+                            speed_state,
+                            curve_score,
+                            steering,
+                            p_term,
+                            d_term,
+                            kp,
+                            kd,
+                            saturation_scale,
+                            left_cmd,
+                            right_cmd,
+                        )
+
+                        if cost_ms > MAX_NETWORK_SEND_COST_MS:
+                            network_slow_count += 1
+                            network_cooldown_until_ms = (
+                                ticks_ms()
+                                + NETWORK_COOLDOWN_MS
+                            )
+
+                        last_debug_report_ms = now
+
+            wait_control_period(loop_start)
 
     except KeyboardInterrupt:
         send_debug_message(
@@ -1601,9 +1581,7 @@ def run():
             try:
                 lap_timer.show(
                     "ERROR",
-                    exc.__class__.__name__[
-                        :16
-                    ],
+                    exc.__class__.__name__[:16],
                     "Motor stopped",
                     "",
                 )
@@ -1624,6 +1602,10 @@ def run():
             max_loop_ms,
             total_compute_ms,
             line_lost_count,
+            telemetry_sent_count,
+            telemetry_skip_count,
+            debug_skip_count,
+            network_slow_count,
         )
 
         if telemetry is not None:
@@ -1635,10 +1617,7 @@ def run():
             except Exception:
                 pass
 
-        if (
-            lap_timer is not None
-            and not finished
-        ):
+        if lap_timer is not None and not finished:
             try:
                 lap_timer.show_stopped()
             except Exception:
@@ -1646,7 +1625,7 @@ def run():
 
 
 # ============================================================
-# 18. Program entry point
+# 19. Program entry point
 # ============================================================
 
 run()
