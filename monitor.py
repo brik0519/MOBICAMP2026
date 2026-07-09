@@ -5,11 +5,12 @@
 #   1. Pico 2 W에서 보내는 UDP binary packet을 수신한다.
 #   2. packet을 unpack해서 CSV 파일로 저장한다.
 #   3. 하나의 figure에 3개의 subplot을 표시한다.
+#   4. PC에서 좌우 모터 명령 평균값을 계산해 평균 속도처럼 함께 plot한다.
 #
-# subplot 구성: a
+# subplot 구성:
 #   1) position
 #   2) error
-#   3) left/right motor command
+#   3) left/right motor command + average speed
 #
 # 주의:
 #   Pico 쪽 pai_udp_telemetry.py의 PACKET_FORMAT과 반드시 같아야 한다.
@@ -116,6 +117,7 @@ pos_buf = deque(maxlen=MAX_POINTS)
 error_buf = deque(maxlen=MAX_POINTS)
 left_buf = deque(maxlen=MAX_POINTS)
 right_buf = deque(maxlen=MAX_POINTS)
+avg_speed_buf = deque(maxlen=MAX_POINTS)
 
 received_count = 0
 bad_packet_count = 0
@@ -266,13 +268,14 @@ line_pos, = ax_pos.plot([], [], label="position")
 line_error, = ax_error.plot([], [], label="error")
 line_left, = ax_motor.plot([], [], label="left")
 line_right, = ax_motor.plot([], [], label="right")
+line_avg_speed, = ax_motor.plot([], [], label="avg speed")
 
 ax_pos.axhline(3500, linestyle="--", linewidth=1, label="center")
 ax_error.axhline(0, linestyle="--", linewidth=1)
 
 ax_pos.set_ylabel("position")
 ax_error.set_ylabel("error")
-ax_motor.set_ylabel("motor cmd")
+ax_motor.set_ylabel("motor cmd / avg speed")
 ax_motor.set_xlabel("time (s)")
 
 ax_pos.set_ylim(0, 7000)
@@ -337,11 +340,16 @@ def receive_available_packets():
             left_value = row["left_cmd"]
             right_value = row["right_cmd"]
 
+        # PC에서 데이터 기반으로 평균 속도 계산
+        # 실제 m/s가 아니라 좌우 모터 명령값의 평균이다.
+        avg_speed = (left_value + right_value) / 2
+
         time_buf.append(t_sec)
         pos_buf.append(row["position"])
         error_buf.append(row["error"])
         left_buf.append(left_value)
         right_buf.append(right_value)
+        avg_speed_buf.append(avg_speed)
 
 
 def update_plot(frame):
@@ -355,6 +363,7 @@ def update_plot(frame):
     line_error.set_data(time_buf, error_buf)
     line_left.set_data(time_buf, left_buf)
     line_right.set_data(time_buf, right_buf)
+    line_avg_speed.set_data(time_buf, avg_speed_buf)
 
     if len(time_buf) >= 2:
         x_min = time_buf[0]
@@ -378,7 +387,7 @@ def update_plot(frame):
         )
     )
 
-    return line_pos, line_error, line_left, line_right
+    return line_pos, line_error, line_left, line_right, line_avg_speed
 
 
 # ------------------------------------------------------------
