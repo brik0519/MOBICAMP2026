@@ -1,0 +1,172 @@
+{
+  "_comment_profile": [
+    "profile_key : section type에 대응하는 주행 프로파일 이름",
+    "현재 단계에서는 PC 표시와 section_marks.csv 기록용",
+    "이후 단계에서 Pico RAM에 속도, PID, 출력 제한값을 전송할 때 사용"
+  ],
+  "_comment_section_types": [
+    "STRAIGHT : 직진 구간",
+    "WIDE_S : 넓은 S자 구간",
+    "NARROW_S : 좁은 S자 구간",
+    "HAIRPIN_U : 헤어핀, 급격한 U턴 구간",
+    "WIDE_U : 완만한 U턴 구간"
+  ],
+
+  "course_name": "mobi_race_track_2026",
+  "version": 1,
+  "section_index_mode": "manual_next_by_space",
+  "description": "Known official race track map. Space key advances to the next section.",
+  "track_size": {
+    "width_m": 1.2,
+    "height_m": 5.0
+  },
+  "section_types": [
+    {
+      "type": "STRAIGHT",
+      "label_ko": "직진",
+      "profile_key": "STRAIGHT"
+    },
+    {
+      "type": "WIDE_S",
+      "label_ko": "넓은 S자",
+      "profile_key": "WIDE_S"
+    },
+    {
+      "type": "NARROW_S",
+      "label_ko": "좁은 S자",
+      "profile_key": "NARROW_S"
+    },
+    {
+      "type": "HAIRPIN_U",
+      "label_ko": "헤어핀",
+      "profile_key": "HAIRPIN_U"
+    },
+    {
+      "type": "WIDE_U",
+      "label_ko": "완만한 U턴",
+      "profile_key": "WIDE_U"
+    }
+  ],
+  "sections": [
+    {
+      "section_id": 0,
+      "display_no": 1,
+      "name": "start_zone",
+      "label_ko": "시작구간",
+      "type": "WIDE_S",
+      "profile_key": "WIDE_S",
+      "role": "START",
+      "note": "넓은 S자 구간을 포함하므로 출발 직후 급가속 금지."
+    },
+    {
+      "section_id": 1,
+      "display_no": 2,
+      "name": "long_straight",
+      "label_ko": "긴 직진 구간",
+      "type": "STRAIGHT",
+      "profile_key": "STRAIGHT",
+      "role": "NORMAL",
+      "note": "가장 높은 속도를 시도할 수 있는 긴 직진 구간."
+    },
+    {
+      "section_id": 2,
+      "display_no": 3,
+      "name": "short_s_1",
+      "label_ko": "짧은 S자",
+      "type": "NARROW_S",
+      "profile_key": "NARROW_S",
+      "role": "NORMAL",
+      "note": "길이가 짧으므로 보수적으로 좁은 S자 profile 적용."
+    },
+    {
+      "section_id": 3,
+      "display_no": 4,
+      "name": "short_straight_1",
+      "label_ko": "짧은 직진",
+      "type": "STRAIGHT",
+      "profile_key": "STRAIGHT",
+      "role": "NORMAL",
+      "note": "직전 S자 이후 자세 안정 확인."
+    },
+    {
+      "section_id": 4,
+      "display_no": 5,
+      "name": "wide_s_1",
+      "label_ko": "넓은 S자",
+      "type": "WIDE_S",
+      "profile_key": "WIDE_S",
+      "role": "NORMAL",
+      "note": "직진보다 감속하고 진동 억제."
+    },
+    {
+      "section_id": 5,
+      "display_no": 6,
+      "name": "narrow_s_1",
+      "label_ko": "좁은 S자",
+      "type": "NARROW_S",
+      "profile_key": "NARROW_S",
+      "role": "NORMAL",
+      "note": "완주 안정성 우선."
+    },
+    {
+      "section_id": 6,
+      "display_no": 7,
+      "name": "hairpin_u_1",
+      "label_ko": "헤어핀",
+      "type": "HAIRPIN_U",
+      "profile_key": "HAIRPIN_U",
+      "role": "NORMAL",
+      "note": "큰 감속과 강한 조향 필요."
+    },
+    {
+      "section_id": 7,
+      "display_no": 8,
+      "name": "middle_straight",
+      "label_ko": "중간 직진구간",
+      "type": "STRAIGHT",
+      "profile_key": "STRAIGHT",
+      "role": "NORMAL",
+      "note": "헤어핀 탈출 후 자세가 안정되면 가속."
+    },
+    {
+      "section_id": 8,
+      "display_no": 9,
+      "name": "wide_u_1",
+      "label_ko": "완만한 U턴",
+      "type": "WIDE_U",
+      "profile_key": "WIDE_U",
+      "role": "NORMAL",
+      "note": "진입 감속 필요."
+    },
+    {
+      "section_id": 9,
+      "display_no": 10,
+      "name": "short_straight_2",
+      "label_ko": "짧은 직진",
+      "type": "STRAIGHT",
+      "profile_key": "STRAIGHT",
+      "role": "NORMAL",
+      "note": "다음 좁은 S자 진입 전 과속 주의."
+    },
+    {
+      "section_id": 10,
+      "display_no": 11,
+      "name": "half_narrow_s",
+      "label_ko": "좁은 S자 절반",
+      "type": "NARROW_S",
+      "profile_key": "NARROW_S",
+      "role": "NORMAL",
+      "note": "짧지만 라인 이탈 위험이 있음."
+    },
+    {
+      "section_id": 11,
+      "display_no": 12,
+      "name": "finish_short_straight",
+      "label_ko": "Finish 전 짧은 직진",
+      "type": "STRAIGHT",
+      "profile_key": "STRAIGHT",
+      "role": "FINISH_APPROACH",
+      "note": "Finish까지 짧은 직진 거리."
+    }
+  ]
+}

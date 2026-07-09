@@ -1,11 +1,12 @@
 # app.py
-# PAI-Car Step 4 PyQtGraph telemetry dashboard + UDP command sender
+# PAI-Car Step 5-2 PyQtGraph telemetry dashboard + course_map section display
 #
 # 목적:
 #   1. Pico 2 W의 기존 UDP telemetry packet VERSION 1을 PC에서 수신한다.
 #   2. 실시간 plot과 CSV 저장을 수행한다.
 #   3. PC 키 입력으로 PING / NEXT_SECTION / EMERGENCY_STOP / RUN command를 Pico로 전송한다.
 #   4. Space 입력 시 현재 telemetry snapshot을 section_marks.csv에 저장한다.
+#   5. course_map.json을 읽어 현재 section의 이름, 종류, profile_key, role을 표시하고 기록한다.
 #
 # 실행:
 #   python app.py
@@ -20,6 +21,7 @@
 #   Enter   RUN
 
 import csv
+import json
 import os
 import socket
 import struct
@@ -73,6 +75,16 @@ def run_qt_app(app):
 
 
 # ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+COURSE_MAP_PATH = os.path.join(APP_DIR, "course_map.json")
+LOG_DIR = os.path.join(APP_DIR, "logs")
+
+
+# ------------------------------------------------------------
 # UDP telemetry receive settings
 # ------------------------------------------------------------
 
@@ -117,6 +129,13 @@ SECTION_MARK_HEADER = [
     "event_type",
     "old_section_id",
     "new_section_id",
+    "section_display_no",
+    "section_name",
+    "section_label_ko",
+    "section_type",
+    "profile_key",
+    "section_role",
+    "section_note",
     "cmd_seq",
     "ack",
     "status",
@@ -134,12 +153,66 @@ SECTION_MARK_HEADER = [
     "packet_loss_count",
 ]
 
-LOG_DIR = "logs"
 MAX_POINTS = 1500
 RECV_TIMER_MS = 5
 COMMAND_TIMER_MS = 20
 PLOT_TIMER_MS = 33
 FLUSH_EVERY_ROWS = 20
+
+SECTION_ACK_TIMEOUT_MS = 1000
+
+
+# ------------------------------------------------------------
+# Course map
+# ------------------------------------------------------------
+
+def load_course_map(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            course_map = json.load(f)
+
+        return course_map, "loaded"
+
+    except FileNotFoundError:
+        return {
+            "course_name": "missing_course_map",
+            "sections": [],
+        }, "missing: {}".format(path)
+
+    except Exception as exc:
+        return {
+            "course_name": "invalid_course_map",
+            "sections": [],
+        }, "error: {}".format(exc)
+
+
+def build_section_index(course_map):
+    sections_by_id = {}
+
+    for section in course_map.get("sections", []):
+        try:
+            section_id = int(section.get("section_id"))
+        except Exception:
+            continue
+
+        sections_by_id[section_id] = section
+
+    section_ids = sorted(sections_by_id.keys())
+
+    return sections_by_id, section_ids
+
+
+def default_section_info(section_id):
+    return {
+        "section_id": section_id,
+        "display_no": "",
+        "name": "unknown_section",
+        "label_ko": "알 수 없는 구간",
+        "type": "UNKNOWN",
+        "profile_key": "UNKNOWN",
+        "role": "UNKNOWN",
+        "note": "",
+    }
 
 
 # ------------------------------------------------------------
@@ -211,8 +284,26 @@ class Dashboard(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("PAI-Car Step 4 Telemetry Dashboard + Section Marker")
-        self.resize(1200, 880)
+        self.setWindowTitle("PAI-Car Step 5-2 Telemetry Dashboard + Course Map")
+        self.resize(1200, 900)
+
+        # --------------------------------------------------------
+        # Course map
+        # --------------------------------------------------------
+
+        self.course_map, self.course_map_status = load_course_map(COURSE_MAP_PATH)
+        self.sections_by_id, self.section_ids = build_section_index(self.course_map)
+
+        if self.section_ids:
+            self.current_section_id = self.section_ids[0]
+        else:
+            self.current_section_id = 0
+
+        self.pending_section_marks = {}
+
+        # --------------------------------------------------------
+        # UDP sockets
+        # --------------------------------------------------------
 
         self.telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.telemetry_sock.bind((LISTEN_IP, LISTEN_PORT))
@@ -222,6 +313,10 @@ class Dashboard(QtWidgets.QMainWindow):
             target_ip=None,
             target_port=COMMAND_PORT,
         )
+
+        # --------------------------------------------------------
+        # CSV logs
+        # --------------------------------------------------------
 
         os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -251,6 +346,10 @@ class Dashboard(QtWidgets.QMainWindow):
         )
         self.section_csv_writer.writeheader()
 
+        # --------------------------------------------------------
+        # Runtime state
+        # --------------------------------------------------------
+
         self.received_count = 0
         self.bad_packet_count = 0
         self.packet_loss_count = 0
@@ -260,10 +359,11 @@ class Dashboard(QtWidgets.QMainWindow):
         self.last_bad_reason = ""
         self.last_pico_ip = None
 
-        self.current_section_id = 0
-        self.pending_section_marks = {}
-
         self.closed = False
+
+        # --------------------------------------------------------
+        # Plot buffers
+        # --------------------------------------------------------
 
         self.t_buf = deque(maxlen=MAX_POINTS)
         self.position_buf = deque(maxlen=MAX_POINTS)
@@ -338,6 +438,51 @@ class Dashboard(QtWidgets.QMainWindow):
 
         self.update_status_label()
 
+    # ------------------------------------------------------------
+    # Section helpers
+    # ------------------------------------------------------------
+
+    def get_section_info(self, section_id=None):
+        if section_id is None:
+            section_id = self.current_section_id
+
+        return self.sections_by_id.get(
+            section_id,
+            default_section_info(section_id),
+        )
+
+    def get_next_section_id(self):
+        if not self.section_ids:
+            return (self.current_section_id + 1) & 0xFFFF
+
+        for section_id in self.section_ids:
+            if section_id > self.current_section_id:
+                return section_id
+
+        # 마지막 section 이후에는 더 넘기지 않는다.
+        return self.current_section_id
+
+    def current_section_text(self):
+        section = self.get_section_info()
+
+        return (
+            "course={}  map_status={}  "
+            "section_id={}  no={}  label={}  type={}  profile={}  role={}"
+        ).format(
+            self.course_map.get("course_name", "unknown"),
+            self.course_map_status,
+            self.current_section_id,
+            section.get("display_no", ""),
+            section.get("label_ko", ""),
+            section.get("type", ""),
+            section.get("profile_key", ""),
+            section.get("role", ""),
+        )
+
+    # ------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------
+
     def update_packet_loss(self, seq):
         if self.last_seq is None:
             self.last_seq = seq
@@ -401,11 +546,17 @@ class Dashboard(QtWidgets.QMainWindow):
 
             self.last_row = row
 
+    # ------------------------------------------------------------
+    # Command / section mark
+    # ------------------------------------------------------------
+
     def poll_command_acks(self):
         acks = self.command_sender.poll_acks()
 
         for ack in acks:
             self.handle_command_ack(ack)
+
+        self.expire_pending_section_marks()
 
     def send_command(self, cmd_type):
         info = self.command_sender.send(cmd_type)
@@ -427,10 +578,19 @@ class Dashboard(QtWidgets.QMainWindow):
             print("NEXT_SECTION ignored: no telemetry yet")
             return
 
+        if self.pending_section_marks:
+            print("NEXT_SECTION ignored: waiting previous ACK")
+            return
+
         old_section_id = self.current_section_id
-        new_section_id = (old_section_id + 1) & 0xFFFF
+        new_section_id = self.get_next_section_id()
+
+        if new_section_id == old_section_id:
+            print("NEXT_SECTION ignored: already at last section")
+            return
 
         snapshot = dict(self.last_row)
+        new_section_info = dict(self.get_section_info(new_section_id))
 
         info = self.command_sender.send(CMD_NEXT_SECTION)
         if info is None:
@@ -441,14 +601,18 @@ class Dashboard(QtWidgets.QMainWindow):
             "snapshot": snapshot,
             "old_section_id": old_section_id,
             "new_section_id": new_section_id,
+            "new_section_info": new_section_info,
             "sent_wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "sent_time": time.monotonic(),
         }
 
         print(
-            "sent NEXT_SECTION: seq={} {} -> {}".format(
+            "sent NEXT_SECTION: seq={} {} -> {}  {} / {}".format(
                 info["seq"],
                 old_section_id,
                 new_section_id,
+                new_section_info.get("label_ko", ""),
+                new_section_info.get("type", ""),
             )
         )
 
@@ -471,14 +635,51 @@ class Dashboard(QtWidgets.QMainWindow):
             ok=ok,
         )
 
+    def expire_pending_section_marks(self):
+        now = time.monotonic()
+        expired_seqs = []
+
+        for seq, pending in self.pending_section_marks.items():
+            elapsed_ms = int((now - pending["sent_time"]) * 1000)
+            if elapsed_ms >= SECTION_ACK_TIMEOUT_MS:
+                expired_seqs.append(seq)
+
+        for seq in expired_seqs:
+            pending = self.pending_section_marks.pop(seq)
+
+            ack = {
+                "cmd_seq": seq,
+                "cmd_type": CMD_NEXT_SECTION,
+                "cmd_name": "NEXT_SECTION",
+                "status": "",
+                "status_name": "TIMEOUT",
+                "rtt_ms": "",
+            }
+
+            self.write_section_mark(
+                pending=pending,
+                ack=ack,
+                ok=False,
+            )
+
+            print("NEXT_SECTION timeout: seq={}".format(seq))
+
     def write_section_mark(self, pending, ack, ok):
         snapshot = pending["snapshot"]
+        section = pending["new_section_info"]
 
         row = {
             "wall_time": datetime.now().isoformat(timespec="milliseconds"),
             "event_type": "NEXT_SECTION",
             "old_section_id": pending["old_section_id"],
             "new_section_id": pending["new_section_id"],
+            "section_display_no": section.get("display_no", ""),
+            "section_name": section.get("name", ""),
+            "section_label_ko": section.get("label_ko", ""),
+            "section_type": section.get("type", ""),
+            "profile_key": section.get("profile_key", ""),
+            "section_role": section.get("role", ""),
+            "section_note": section.get("note", ""),
             "cmd_seq": ack.get("cmd_seq", ""),
             "ack": 1 if ok else 0,
             "status": ack.get("status_name", ""),
@@ -500,14 +701,20 @@ class Dashboard(QtWidgets.QMainWindow):
         self.section_csv_file.flush()
 
         print(
-            "section mark: {} -> {} ack={} status={} rtt={}ms".format(
+            "section mark: {} -> {}  {} / {}  ack={} status={} rtt={}ms".format(
                 row["old_section_id"],
                 row["new_section_id"],
+                row["section_label_ko"],
+                row["section_type"],
                 row["ack"],
                 row["status"],
                 row["rtt_ms"],
             )
         )
+
+    # ------------------------------------------------------------
+    # Key input
+    # ------------------------------------------------------------
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -530,6 +737,10 @@ class Dashboard(QtWidgets.QMainWindow):
 
         super().keyPressEvent(event)
 
+    # ------------------------------------------------------------
+    # UI update
+    # ------------------------------------------------------------
+
     def update_status_label(self):
         if self.received_count > 0:
             denom = self.received_count + self.packet_loss_count
@@ -548,15 +759,17 @@ class Dashboard(QtWidgets.QMainWindow):
 
         command_help = "keys: P=PING  Space=NEXT_SECTION  Z=EMERGENCY_STOP  Enter=RUN"
 
-        command_status = "{}  section_id={}  pending_section_marks={}".format(
+        command_status = "{}  pending_section_marks={}".format(
             self.command_sender.stats_text(),
-            self.current_section_id,
             len(self.pending_section_marks),
         )
+
+        section_status = self.current_section_text()
 
         self.status_label.setText(
             "telemetry_listen={}:{}  packet_size={}  version={}  "
             "received={}  lost={} ({:.2f}%)  bad={}  last_age={}ms  bad_reason={}\n"
+            "{}\n"
             "{}\n"
             "{}\n"
             "CSV={}\n"
@@ -573,6 +786,7 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.last_packet_age_ms(),
                 self.last_bad_reason,
                 command_status,
+                section_status,
                 command_help,
                 self.csv_path,
                 self.section_csv_path,
@@ -609,6 +823,10 @@ class Dashboard(QtWidgets.QMainWindow):
                 p.setXRange(x_min, x_max, padding=0)
 
         self.update_status_label()
+
+    # ------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------
 
     def closeEvent(self, event):
         self.close_resources()
