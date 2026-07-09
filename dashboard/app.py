@@ -1,10 +1,11 @@
 # app.py
-# PAI-Car Step 3 PyQtGraph telemetry dashboard + UDP command sender
+# PAI-Car Step 4 PyQtGraph telemetry dashboard + UDP command sender
 #
 # 목적:
 #   1. Pico 2 W의 기존 UDP telemetry packet VERSION 1을 PC에서 수신한다.
 #   2. 실시간 plot과 CSV 저장을 수행한다.
-#   3. PC 키 입력으로 PING / STOP / SAFE_MODE / RUN command를 Pico로 전송한다.
+#   3. PC 키 입력으로 PING / NEXT_SECTION / EMERGENCY_STOP / RUN command를 Pico로 전송한다.
+#   4. Space 입력 시 현재 telemetry snapshot을 section_marks.csv에 저장한다.
 #
 # 실행:
 #   python app.py
@@ -14,8 +15,8 @@
 #
 # 키:
 #   P       PING
-#   Space   STOP
-#   Z       SAFE_MODE
+#   Space   NEXT_SECTION
+#   Z       EMERGENCY_STOP
 #   Enter   RUN
 
 import csv
@@ -111,6 +112,28 @@ CSV_HEADER = [
     "last_packet_age_ms",
 ]
 
+SECTION_MARK_HEADER = [
+    "wall_time",
+    "event_type",
+    "old_section_id",
+    "new_section_id",
+    "cmd_seq",
+    "ack",
+    "status",
+    "rtt_ms",
+    "seq",
+    "t_ms",
+    "base_speed",
+    "position",
+    "error",
+    "d_error",
+    "left_cmd",
+    "right_cmd",
+    "on_line",
+    "is_marker",
+    "packet_loss_count",
+]
+
 LOG_DIR = "logs"
 MAX_POINTS = 1500
 RECV_TIMER_MS = 5
@@ -188,7 +211,7 @@ class Dashboard(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("PAI-Car Step 3 Telemetry Dashboard + Command Sender")
+        self.setWindowTitle("PAI-Car Step 4 Telemetry Dashboard + Section Marker")
         self.resize(1200, 880)
 
         self.telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -201,13 +224,32 @@ class Dashboard(QtWidgets.QMainWindow):
         )
 
         os.makedirs(LOG_DIR, exist_ok=True)
+
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         self.csv_path = os.path.join(
             LOG_DIR,
-            "pai_car_pyqt_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M%S")),
+            "pai_car_pyqt_{}.csv".format(self.run_id),
         )
         self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_HEADER)
         self.csv_writer.writeheader()
+
+        self.section_csv_path = os.path.join(
+            LOG_DIR,
+            "section_marks_{}.csv".format(self.run_id),
+        )
+        self.section_csv_file = open(
+            self.section_csv_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+        )
+        self.section_csv_writer = csv.DictWriter(
+            self.section_csv_file,
+            fieldnames=SECTION_MARK_HEADER,
+        )
+        self.section_csv_writer.writeheader()
 
         self.received_count = 0
         self.bad_packet_count = 0
@@ -217,6 +259,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.last_row = None
         self.last_bad_reason = ""
         self.last_pico_ip = None
+
+        self.current_section_id = 0
+        self.pending_section_marks = {}
+
         self.closed = False
 
         self.t_buf = deque(maxlen=MAX_POINTS)
@@ -356,7 +402,10 @@ class Dashboard(QtWidgets.QMainWindow):
             self.last_row = row
 
     def poll_command_acks(self):
-        self.command_sender.poll_acks()
+        acks = self.command_sender.poll_acks()
+
+        for ack in acks:
+            self.handle_command_ack(ack)
 
     def send_command(self, cmd_type):
         info = self.command_sender.send(cmd_type)
@@ -373,6 +422,93 @@ class Dashboard(QtWidgets.QMainWindow):
             )
         )
 
+    def request_next_section(self):
+        if self.last_row is None:
+            print("NEXT_SECTION ignored: no telemetry yet")
+            return
+
+        old_section_id = self.current_section_id
+        new_section_id = (old_section_id + 1) & 0xFFFF
+
+        snapshot = dict(self.last_row)
+
+        info = self.command_sender.send(CMD_NEXT_SECTION)
+        if info is None:
+            print("NEXT_SECTION not sent:", self.command_sender.last_error)
+            return
+
+        self.pending_section_marks[info["seq"]] = {
+            "snapshot": snapshot,
+            "old_section_id": old_section_id,
+            "new_section_id": new_section_id,
+            "sent_wall_time": datetime.now().isoformat(timespec="milliseconds"),
+        }
+
+        print(
+            "sent NEXT_SECTION: seq={} {} -> {}".format(
+                info["seq"],
+                old_section_id,
+                new_section_id,
+            )
+        )
+
+    def handle_command_ack(self, ack):
+        if ack.get("cmd_type") != CMD_NEXT_SECTION:
+            return
+
+        pending = self.pending_section_marks.pop(ack["cmd_seq"], None)
+        if pending is None:
+            return
+
+        ok = ack.get("status_name") == "OK"
+
+        if ok:
+            self.current_section_id = pending["new_section_id"]
+
+        self.write_section_mark(
+            pending=pending,
+            ack=ack,
+            ok=ok,
+        )
+
+    def write_section_mark(self, pending, ack, ok):
+        snapshot = pending["snapshot"]
+
+        row = {
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "event_type": "NEXT_SECTION",
+            "old_section_id": pending["old_section_id"],
+            "new_section_id": pending["new_section_id"],
+            "cmd_seq": ack.get("cmd_seq", ""),
+            "ack": 1 if ok else 0,
+            "status": ack.get("status_name", ""),
+            "rtt_ms": ack.get("rtt_ms", ""),
+            "seq": snapshot.get("seq", ""),
+            "t_ms": snapshot.get("t_ms", ""),
+            "base_speed": snapshot.get("base_speed", ""),
+            "position": snapshot.get("position", ""),
+            "error": snapshot.get("error", ""),
+            "d_error": snapshot.get("d_error", ""),
+            "left_cmd": snapshot.get("left_cmd", ""),
+            "right_cmd": snapshot.get("right_cmd", ""),
+            "on_line": snapshot.get("on_line", ""),
+            "is_marker": snapshot.get("is_marker", ""),
+            "packet_loss_count": self.packet_loss_count,
+        }
+
+        self.section_csv_writer.writerow(row)
+        self.section_csv_file.flush()
+
+        print(
+            "section mark: {} -> {} ack={} status={} rtt={}ms".format(
+                row["old_section_id"],
+                row["new_section_id"],
+                row["ack"],
+                row["status"],
+                row["rtt_ms"],
+            )
+        )
+
     def keyPressEvent(self, event):
         key = event.key()
 
@@ -381,7 +517,7 @@ class Dashboard(QtWidgets.QMainWindow):
             return
 
         if key == KEY_SPACE:
-            self.send_command(CMD_NEXT_SECTION)
+            self.request_next_section()
             return
 
         if key == KEY_Z:
@@ -412,12 +548,19 @@ class Dashboard(QtWidgets.QMainWindow):
 
         command_help = "keys: P=PING  Space=NEXT_SECTION  Z=EMERGENCY_STOP  Enter=RUN"
 
+        command_status = "{}  section_id={}  pending_section_marks={}".format(
+            self.command_sender.stats_text(),
+            self.current_section_id,
+            len(self.pending_section_marks),
+        )
+
         self.status_label.setText(
             "telemetry_listen={}:{}  packet_size={}  version={}  "
             "received={}  lost={} ({:.2f}%)  bad={}  last_age={}ms  bad_reason={}\n"
             "{}\n"
             "{}\n"
             "CSV={}\n"
+            "SECTION_CSV={}\n"
             "{}".format(
                 LISTEN_IP,
                 LISTEN_PORT,
@@ -429,9 +572,10 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.bad_packet_count,
                 self.last_packet_age_ms(),
                 self.last_bad_reason,
-                self.command_sender.stats_text(),
+                command_status,
                 command_help,
                 self.csv_path,
+                self.section_csv_path,
                 current,
             )
         )
@@ -482,6 +626,12 @@ class Dashboard(QtWidgets.QMainWindow):
             pass
 
         try:
+            self.section_csv_file.flush()
+            self.section_csv_file.close()
+        except Exception:
+            pass
+
+        try:
             self.telemetry_sock.close()
         except Exception:
             pass
@@ -492,6 +642,7 @@ class Dashboard(QtWidgets.QMainWindow):
             pass
 
         print("CSV saved:", self.csv_path)
+        print("section CSV saved:", self.section_csv_path)
         print("received:", self.received_count)
         print("lost:", self.packet_loss_count)
         print("bad:", self.bad_packet_count)
