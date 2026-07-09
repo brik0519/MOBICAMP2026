@@ -7,22 +7,17 @@
 #   - 엔코더 없는 모터 기준
 #   - error / d_error 기반 속도 제어
 #   - 라인 미검출 시 마지막 error 방향 저속 탐색
-#   - UDP 확장 포맷 유지, encoder 관련 값은 0으로 전송
+#   - UDP 기본 V1 telemetry 포맷 유지
 #
-# 롤백:
-#   - finish 판별은 기본 lap_timer.check_finish(norm, on_line) 사용
-#   - 공격적인 black_count 기반 즉시 종료 판정 제거
-#
-# 현재 목표:
-#   1. 코스 중간 오정지 방지
-#   2. 48~49초대 완주 안정성 유지
-#   3. 라인 미검출 시 복구 시도
-#   4. UDP 로그 분석 유지
+# 추가:
+#   - PC -> Pico UDP command 수신
+#   - PING / STOP / SAFE_MODE / RUN 지원
+#   - STOP / SAFE_MODE 상태에서는 최종 모터 출력만 0으로 덮어씀
+#   - 버튼 직후 시작선 중복 finish 오검출 방지
 
 from time import ticks_ms, ticks_diff
 
 from modules.pai_car_run_support import (
-    CONTROL_MS,
     create_lap_timer,
     setup_paicar,
     self_calibrate_or_stop,
@@ -36,6 +31,7 @@ from modules.pai_udp_telemetry import (
 )
 
 from modules.pai_udp_command import PAIUdpCommand
+
 
 # ------------------------------------------------------------
 # PD-control settings
@@ -63,9 +59,6 @@ MIN_RUN_SPEED = 500
 # ------------------------------------------------------------
 # Optional time-based slow zones
 # ------------------------------------------------------------
-#
-# 엔코더가 없으므로 distance 기반 slow zone은 사용할 수 없다.
-# elapsed_ms 기반 slow zone은 위치가 밀릴 수 있으므로 기본 비활성.
 
 TIME_SLOW_ZONES = []
 
@@ -81,12 +74,14 @@ LINE_LOSS_MAX_MS = 250
 # ------------------------------------------------------------
 # Marker display / logging settings
 # ------------------------------------------------------------
-#
-# finish 판별 자체는 lap_timer.check_finish()에 맡긴다.
-# 아래 값은 CSV의 is_marker 표시용으로만 사용한다.
 
 T_MARKER_TH = 700
 T_MARKER_MIN_COUNT = 6
+
+# 시작선 위에서 버튼을 누른 직후,
+# 같은 시작선을 finish로 중복 인식하지 않도록
+# marker가 사라진 상태를 연속 몇 회 확인할지 결정한다.
+START_MARKER_RELEASE_COUNT = 5
 
 
 # ------------------------------------------------------------
@@ -113,7 +108,6 @@ def limit_drive_cmd(value, error):
 
     ae = abs(error)
 
-    # 급커브 판정을 늦춘 speed_from_error()와 맞춰 역회전 허용도 늦춘다.
     if ae >= 2400:
         min_cmd = -420
     elif ae >= 1650:
@@ -143,7 +137,7 @@ def count_black_sensors(norm):
 def marker_detected_now(norm, on_line):
     """
     CSV 표시용 marker 판정.
-    정지 판정에는 사용하지 않는다.
+    정지 판정에는 직접 사용하지 않는다.
     """
 
     if not on_line:
@@ -152,6 +146,23 @@ def marker_detected_now(norm, on_line):
     black_count = count_black_sensors(norm)
 
     return black_count >= T_MARKER_MIN_COUNT
+
+
+def arm_start_marker_if_needed(lap_timer, norm, on_line):
+    """
+    버튼을 누른 직후 차량이 시작선 위에 있으면,
+    시작 marker를 이미 1회 본 상태로 둔다.
+
+    이렇게 해야 finish 지점에서 다음 marker가 2번째 marker로 처리된다.
+    """
+
+    if marker_detected_now(norm, on_line):
+        lap_timer.t_marker_count = 1
+        lap_timer.t_marker_active = True
+        lap_timer.t_marker_release_count = 0
+        return True
+
+    return False
 
 
 def speed_from_time(elapsed_ms):
@@ -171,10 +182,6 @@ def speed_from_error(base_speed, error, d_error):
 
     speed = base_speed
 
-    # 최신 의도 기준:
-    #   - base_speed=680 구간을 줄인다.
-    #   - 불필요한 역회전을 줄인다.
-    #   - 단, speed 값 자체는 아직 올리지 않는다.
     if ae > 2400 or ad > 1700:
         speed = min(speed, SHARP_CURVE_SPEED)
 
@@ -194,10 +201,7 @@ def send_stop_packet(
     position,
     error,
     on_line,
-    is_marker,
-    last_udp_loop_ms,
-    last_udp_send_cost_ms,
-    last_udp_overrun
+    is_marker
 ):
     telemetry.send_now(
         target_speed,
@@ -208,18 +212,7 @@ def send_stop_packet(
         0,  # left_cmd
         0,  # right_cmd
         on_line,
-        is_marker,
-
-        0,  # distance_ticks
-        0,  # left_speed
-        0,  # right_speed
-        0,  # dl
-        0,  # dr
-        0,  # heading_ticks
-
-        last_udp_loop_ms,
-        last_udp_send_cost_ms,
-        last_udp_overrun
+        is_marker
     )
 
 
@@ -236,6 +229,7 @@ telemetry.begin()
 
 cmd = PAIUdpCommand(require_heartbeat=False)
 cmd.begin()
+
 
 # ------------------------------------------------------------
 # Self calibration
@@ -257,6 +251,22 @@ run_start_ms = ticks_ms()
 
 
 # ------------------------------------------------------------
+# Start marker guard
+# ------------------------------------------------------------
+
+_start_error, _start_position, _start_norm, _start_on_line = read_line_detail(line)
+
+start_marker_armed = arm_start_marker_if_needed(
+    lap_timer,
+    _start_norm,
+    _start_on_line
+)
+
+start_marker_released = not start_marker_armed
+start_marker_release_count = 0
+
+
+# ------------------------------------------------------------
 # PD-control line tracing
 # ------------------------------------------------------------
 
@@ -273,10 +283,6 @@ target_speed = BASE_SPEED
 
 line_lost_start_ms = None
 
-last_udp_loop_ms = 0
-last_udp_send_cost_ms = 0
-last_udp_overrun = 0
-
 try:
     while True:
         loop_start = ticks_ms()
@@ -285,50 +291,63 @@ try:
         elapsed_ms = ticks_diff(now_ms, run_start_ms)
 
         # --------------------------------------------------------
-        # 1. 라인센서 읽기
+        # 0. PC command 수신
         # --------------------------------------------------------
+
         cmd.poll()
         force_stop = cmd.should_force_stop()
 
+        # --------------------------------------------------------
+        # 1. 라인센서 읽기
+        # --------------------------------------------------------
 
         error, position, norm, on_line = read_line_detail(line)
 
-        # CSV 표시용 marker.
-        # 실제 finish 정지는 lap_timer.check_finish()만 사용한다.
         is_marker = marker_detected_now(norm, on_line)
 
         # --------------------------------------------------------
-        # 2. Finish 확인: 기본 방식으로 롤백
+        # 2. Finish 확인
         # --------------------------------------------------------
         #
-        # 중요:
-        #   black_count 기반 즉시 종료 판정은 사용하지 않는다.
-        #   코스 중간 복수 센서 감지로 오정지한 문제가 있었으므로
-        #   기본 lap_timer.check_finish()에 맡긴다.
+        # 시작선 위에서 버튼을 누른 경우,
+        # 시작선을 완전히 벗어나기 전까지 finish 판별을 막는다.
+        #
+        # 단, 시작선을 그냥 무시하는 것이 아니라
+        # start marker를 이미 1회 본 상태로 둔다.
+        # 그래야 실제 finish 선에서 정지할 수 있다.
 
-        if lap_timer.check_finish(norm, on_line):
-            d_error = 0
-            left_cmd = 0
-            right_cmd = 0
-            target_speed = 0
+        if not start_marker_released:
+            if marker_detected_now(norm, on_line):
+                start_marker_release_count = 0
+            else:
+                start_marker_release_count += 1
 
-            motors.stop()
-            finished = True
+                if start_marker_release_count >= START_MARKER_RELEASE_COUNT:
+                    start_marker_released = True
+                    lap_timer.t_marker_active = False
+                    lap_timer.t_marker_release_count = 0
 
-            send_stop_packet(
-                telemetry,
-                target_speed,
-                norm,
-                position,
-                error,
-                on_line,
-                is_marker,
-                last_udp_loop_ms,
-                last_udp_send_cost_ms,
-                last_udp_overrun
-            )
+        else:
+            if lap_timer.check_finish(norm, on_line):
+                d_error = 0
+                left_cmd = 0
+                right_cmd = 0
+                target_speed = 0
 
-            break
+                motors.stop()
+                finished = True
+
+                send_stop_packet(
+                    telemetry,
+                    target_speed,
+                    norm,
+                    position,
+                    error,
+                    on_line,
+                    is_marker
+                )
+
+                break
 
         # --------------------------------------------------------
         # 3. PD 제어 + 라인 미검출 복구
@@ -366,34 +385,7 @@ try:
                 error
             )
 
-            # if force_stop:
-            #     target_speed = 0
-            #     left_cmd = 0
-            #     right_cmd = 0
-            #     motors.stop()
-            # else:
-            #     motors.drive(left_cmd, right_cmd)
-
-            if force_stop:
-                left_cmd = 0
-                right_cmd = 0
-                motors.stop()
-
-            else:
-                if loss_ms <= LINE_LOSS_MAX_MS:
-                    if last_error < 0:
-                        left_cmd = -SEARCH_PWM
-                        right_cmd = SEARCH_PWM
-                    else:
-                        left_cmd = SEARCH_PWM
-                        right_cmd = -SEARCH_PWM
-
-                    motors.drive(left_cmd, right_cmd)
-
-                else:
-                    left_cmd = 0
-                    right_cmd = 0
-                    motors.stop()
+            motors.drive(left_cmd, right_cmd)
 
         else:
             now = ticks_ms()
@@ -407,7 +399,6 @@ try:
             target_speed = 0
             was_on_line = False
 
-            # 마지막으로 보았던 error 방향으로 저속 제자리 탐색한다.
             if loss_ms <= LINE_LOSS_MAX_MS:
                 if last_error < 0:
                     left_cmd = -SEARCH_PWM
@@ -424,10 +415,26 @@ try:
                 motors.stop()
 
         # --------------------------------------------------------
+        # 3-1. PC STOP / SAFE_MODE 강제 정지
+        # --------------------------------------------------------
+        #
+        # 기존 라인트레이싱 계산과 복구 로직은 그대로 수행한 뒤,
+        # STOP 또는 SAFE_MODE 상태일 때만 최종 모터 출력을 0으로 덮어쓴다.
+
+        if force_stop:
+            target_speed = 0
+            left_cmd = 0
+            right_cmd = 0
+            motors.stop()
+
+        # --------------------------------------------------------
         # 4. 주행 데이터 전송
         # --------------------------------------------------------
+        #
+        # 현재 pai_udp_telemetry.py는 기본 V1 telemetry 인자만 받는다.
+        # 따라서 distance_ticks, udp_loop_ms 등 확장 인자는 보내지 않는다.
 
-        sent = telemetry.send_if_due(
+        telemetry.send_if_due(
             target_speed,
             norm,
             position,
@@ -436,30 +443,8 @@ try:
             left_cmd,
             right_cmd,
             on_line,
-            is_marker,
-
-            0,  # distance_ticks
-            0,  # left_speed
-            0,  # right_speed
-            0,  # dl
-            0,  # dr
-            0,  # heading_ticks
-
-            last_udp_loop_ms,
-            last_udp_send_cost_ms,
-            last_udp_overrun
+            is_marker
         )
-
-        loop_after_udp_ms = ticks_diff(ticks_ms(), loop_start)
-
-        if sent:
-            last_udp_loop_ms = loop_after_udp_ms
-            last_udp_send_cost_ms = telemetry.last_send_cost_ms
-
-            if loop_after_udp_ms > CONTROL_MS:
-                last_udp_overrun = 1
-            else:
-                last_udp_overrun = 0
 
         # --------------------------------------------------------
         # 5. OLED 갱신
