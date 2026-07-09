@@ -1,2 +1,0 @@
-start_ms,finish_ms,lap_time_ms,samples,max_base_speed,max_avg_cmd,max_peak_cmd,avg_base_speed,avg_avg_cmd,avg_peak_cmd,max_abs_error,max_abs_d_error,lost_count,marker_count
-184,6098,5914,247,1000,993,1000,1000.0,891.5344129554655,951.417004048583,2805,1345,11,2
