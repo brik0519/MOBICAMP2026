@@ -2,6 +2,7 @@
 # PAI-Car stabilized PD controller
 # - center deadband and steering smoothing
 # - derivative deadband
+# - steering slew limit
 # - continuous curve-speed planner
 # - speed-dependent gain scheduling
 # - inner wheel floor during tracking
@@ -73,7 +74,8 @@ DEBUG_REPORT_MAX_LAG_MS = 1500
 # 3. Speed planner settings
 # ============================================================
 
-# 102.75초 주행은 안정적이었지만 너무 느렸으므로 일부 속도를 복구한다.
+# 93.34초 주행에서 속도는 충분히 회복됨.
+# 이번 버전에서는 속도값은 유지하고 조향 흔들림만 줄인다.
 MAX_TRACK_SPEED = 580
 MEDIUM_CURVE_SPEED = 430
 SHARP_CURVE_SPEED = 290
@@ -106,13 +108,14 @@ CURVE_ACCEL_WEIGHT = 0.10
 # 4. PD controller settings
 # ============================================================
 
+# 코너 좌우 흔들림 완화를 위해 curve/sharp gain을 낮춘다.
 KP_STRAIGHT = 0.20
-KP_CURVE = 0.26
-KP_SHARP = 0.32
+KP_CURVE = 0.24
+KP_SHARP = 0.28
 
 KD_STRAIGHT = 0.65
-KD_CURVE = 0.60
-KD_SHARP = 0.45
+KD_CURVE = 0.55
+KD_SHARP = 0.40
 
 ERROR_DEADBAND = 100.0
 
@@ -120,10 +123,16 @@ D_ERROR_DEADBAND = 120.0
 D_RATE_DEADBAND = 45.0
 
 MAX_STEERING_STRAIGHT = 260
-MAX_STEERING_CURVE = 380
-MAX_STEERING_SHARP = 470
+MAX_STEERING_CURVE = 360
+MAX_STEERING_SHARP = 430
 
-STEERING_FILTER_ALPHA = 0.30
+# 값이 작을수록 이전 조향을 더 많이 유지하므로 조향 변화가 부드러워진다.
+STEERING_FILTER_ALPHA = 0.26
+
+# 조향 변화율 제한.
+STEERING_SLEW_STRAIGHT = 45
+STEERING_SLEW_CURVE = 35
+STEERING_SLEW_SHARP = 28
 
 
 # ============================================================
@@ -162,7 +171,6 @@ MOTOR_FALL_STEP = 160
 
 ALLOW_REVERSE_TRACKING = False
 
-# 라인 추종 중 안쪽 바퀴가 0에 붙어 피벗처럼 도는 것을 막는다.
 INNER_MIN_TRACKING_CMD = 90
 
 
@@ -535,6 +543,29 @@ def apply_derivative_deadband(error, rate):
     return rate
 
 
+def limit_steering_slew(
+    target_steering,
+    previous_steering,
+    curve_score,
+):
+    if curve_score >= CURVE_SCORE_SHARP:
+        step = STEERING_SLEW_SHARP
+    elif curve_score >= CURVE_SCORE_MEDIUM:
+        step = STEERING_SLEW_CURVE
+    else:
+        step = STEERING_SLEW_STRAIGHT
+
+    delta = target_steering - previous_steering
+
+    if delta > step:
+        return previous_steering + step
+
+    if delta < -step:
+        return previous_steering - step
+
+    return target_steering
+
+
 def calculate_steering(
     features,
     curve_score,
@@ -573,8 +604,14 @@ def calculate_steering(
         )
     )
 
+    limited_steering = limit_steering_slew(
+        filtered_steering,
+        previous_steering,
+        curve_score,
+    )
+
     return (
-        int(filtered_steering),
+        int(limited_steering),
         p_term,
         d_term,
         kp,
@@ -683,9 +720,6 @@ def apply_inner_wheel_floor(
             right_cmd,
         )
 
-    # 중요:
-    # 기존 방식은 left_cmd/right_cmd가 이미 0으로 잘린 경우 복구하지 못했다.
-    # 라인 추종 중에는 0으로 잘린 안쪽 바퀴도 최소 전진 출력으로 살린다.
     if left_cmd <= 0:
         left_cmd = INNER_MIN_TRACKING_CMD
     elif left_cmd < INNER_MIN_TRACKING_CMD:
