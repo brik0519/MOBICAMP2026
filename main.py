@@ -62,14 +62,10 @@ DEBUG_REPORT_MS = 1000
 
 OVERRUN_THRESHOLD_MS = CONTROL_PERIOD_MS
 
-# 네트워크 전송이 이 시간 이상 걸리면 이후 일정 시간 송신을 건너뛴다.
 MAX_NETWORK_SEND_COST_MS = 2
 NETWORK_COOLDOWN_MS = 120
 
-# 제어 루프 계산이 이 값 이상 걸린 루프에서는 telemetry 샘플을 버린다.
 TELEMETRY_SKIP_COMPUTE_MS = 7
-
-# debug report가 밀리면 오래된 report를 보내지 않고 버린다.
 DEBUG_REPORT_MAX_LAG_MS = 1500
 
 
@@ -77,22 +73,23 @@ DEBUG_REPORT_MAX_LAG_MS = 1500
 # 3. Speed planner settings
 # ============================================================
 
-MAX_TRACK_SPEED = 560
-MEDIUM_CURVE_SPEED = 400
-SHARP_CURVE_SPEED = 270
-VERY_SHARP_SPEED = 220
-LOW_CONFIDENCE_SPEED = 220
+# 102.75초 주행은 안정적이었지만 너무 느렸으므로 일부 속도를 복구한다.
+MAX_TRACK_SPEED = 580
+MEDIUM_CURVE_SPEED = 430
+SHARP_CURVE_SPEED = 290
+VERY_SHARP_SPEED = 230
+LOW_CONFIDENCE_SPEED = 230
 
 RECOVERY_FORWARD_SPEED = 180
 RECOVERY_TURN_SPEED = 330
 RECOVERY_PIVOT_SPEED = 260
 
-SPEED_RISE_STEP = 4
-SPEED_FALL_STEP = 55
+SPEED_RISE_STEP = 5
+SPEED_FALL_STEP = 50
 
-CURVE_SCORE_MEDIUM = 0.16
-CURVE_SCORE_SHARP = 0.40
-CURVE_SCORE_VERY_SHARP = 0.68
+CURVE_SCORE_MEDIUM = 0.18
+CURVE_SCORE_SHARP = 0.43
+CURVE_SCORE_VERY_SHARP = 0.70
 
 LOW_CONFIDENCE_THRESHOLD = 0.30
 
@@ -119,7 +116,6 @@ KD_SHARP = 0.45
 
 ERROR_DEADBAND = 100.0
 
-# 중앙 근처에서는 D항도 죽인다.
 D_ERROR_DEADBAND = 120.0
 D_RATE_DEADBAND = 45.0
 
@@ -687,10 +683,17 @@ def apply_inner_wheel_floor(
             right_cmd,
         )
 
-    if 0 < left_cmd < INNER_MIN_TRACKING_CMD:
+    # 중요:
+    # 기존 방식은 left_cmd/right_cmd가 이미 0으로 잘린 경우 복구하지 못했다.
+    # 라인 추종 중에는 0으로 잘린 안쪽 바퀴도 최소 전진 출력으로 살린다.
+    if left_cmd <= 0:
+        left_cmd = INNER_MIN_TRACKING_CMD
+    elif left_cmd < INNER_MIN_TRACKING_CMD:
         left_cmd = INNER_MIN_TRACKING_CMD
 
-    if 0 < right_cmd < INNER_MIN_TRACKING_CMD:
+    if right_cmd <= 0:
+        right_cmd = INNER_MIN_TRACKING_CMD
+    elif right_cmd < INNER_MIN_TRACKING_CMD:
         right_cmd = INNER_MIN_TRACKING_CMD
 
     return (
@@ -1092,15 +1095,29 @@ def run():
         ) = setup_paicar(lap_timer)
 
         if DEBUG_MODE:
-            telemetry = PAIUdpTelemetry(lap_timer)
-            telemetry.begin()
+            telemetry_ok = False
 
-            # pai_udp_telemetry.py가 blocking socket이면 여기서 가능한 경우 non-blocking 처리한다.
-            try:
-                if telemetry.sock is not None:
-                    telemetry.sock.setblocking(False)
-            except Exception:
-                pass
+            telemetry = PAIUdpTelemetry(lap_timer)
+            telemetry_ok = telemetry.begin()
+
+            if telemetry_ok:
+                try:
+                    if telemetry.sock is not None:
+                        telemetry.sock.setblocking(False)
+                except Exception:
+                    pass
+            else:
+                telemetry = None
+
+                try:
+                    lap_timer.show(
+                        "UDP FAILED",
+                        "WiFi/IP check",
+                        "No telemetry",
+                        "",
+                    )
+                except Exception:
+                    pass
 
             debug_socket = create_debug_socket()
 
@@ -1111,11 +1128,13 @@ def run():
                 debug_socket,
                 (
                     "type=boot,"
+                    "telemetry_ok={},"
                     "control_ms={},"
                     "max_speed={},"
                     "kp_straight={:.3f},"
                     "kd_straight={:.3f}"
                 ).format(
+                    telemetry_ok,
                     CONTROL_PERIOD_MS,
                     MAX_TRACK_SPEED,
                     KP_STRAIGHT,
@@ -1264,7 +1283,7 @@ def run():
                             now,
                             network_cooldown_until_ms,
                         ) >= 0:
-                            telemetry.send_now(
+                            ok = telemetry.send_now(
                                 current_speed,
                                 norm,
                                 position,
@@ -1276,7 +1295,10 @@ def run():
                                 is_marker,
                             )
 
-                            telemetry_sent_count += 1
+                            if ok:
+                                telemetry_sent_count += 1
+                            else:
+                                telemetry_skip_count += 1
                         else:
                             telemetry_skip_count += 1
 
@@ -1431,13 +1453,12 @@ def run():
             previous_right_cmd = right_cmd
 
             compute_mid = ticks_ms()
+
             compute_before_network_ms = ticks_diff(
                 compute_mid,
                 loop_start,
             )
 
-            # telemetry는 제어보다 우선순위가 낮다.
-            # 계산이 이미 오래 걸렸거나 네트워크 cooldown 중이면 해당 샘플을 삭제한다.
             if telemetry is not None:
                 now = ticks_ms()
 
@@ -1454,7 +1475,7 @@ def run():
                     send_start = ticks_ms()
 
                     try:
-                        telemetry.send_if_due(
+                        ok = telemetry.send_if_due(
                             current_speed,
                             norm,
                             position,
@@ -1466,10 +1487,12 @@ def run():
                             is_marker,
                         )
 
-                        telemetry_sent_count += 1
+                        if ok:
+                            telemetry_sent_count += 1
 
                     except Exception:
                         telemetry_skip_count += 1
+                        ok = False
 
                     send_cost_ms = ticks_diff(
                         ticks_ms(),
@@ -1509,7 +1532,6 @@ def run():
 
                 if debug_elapsed_ms >= DEBUG_REPORT_MS:
                     if debug_elapsed_ms > DEBUG_REPORT_MAX_LAG_MS:
-                        # 오래 밀린 debug report는 보내지 않고 버린다.
                         debug_skip_count += 1
                         last_debug_report_ms = now
 
@@ -1593,6 +1615,28 @@ def run():
     finally:
         if motors is not None:
             motors.stop()
+
+        if telemetry is not None:
+            try:
+                (
+                    tele_sent,
+                    tele_drop_lag,
+                    tele_drop_busy,
+                    tele_slow,
+                ) = telemetry.get_stats()
+
+                if tele_sent > telemetry_sent_count:
+                    telemetry_sent_count = tele_sent
+
+                telemetry_skip_count += (
+                    tele_drop_lag
+                    + tele_drop_busy
+                )
+
+                network_slow_count += tele_slow
+
+            except Exception:
+                pass
 
         send_final_report(
             debug_socket,
