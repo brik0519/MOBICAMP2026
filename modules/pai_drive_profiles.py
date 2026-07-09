@@ -25,7 +25,6 @@ MOTOR_CMD_MAX = 1000
 # ------------------------------------------------------------
 # Profile table
 # ------------------------------------------------------------
-
 PROFILES = {
     "STRAIGHT": {
         "label_ko": "직진",
@@ -50,19 +49,19 @@ PROFILES = {
     "WIDE_S": {
         "label_ko": "넓은 S자",
         "base_speed": 1000,
-        "curve_speed": 950,
-        "sharp_curve_speed": 830,
-        "min_run_speed": 580,
-        "kp_x1000": 550,
-        "kd_x1000": 220,
-        "max_correction": 950,
+        "curve_speed": 980,
+        "sharp_curve_speed": 880,
+        "min_run_speed": 600,
+        "kp_x1000": 530,
+        "kd_x1000": 200,
+        "max_correction": 900,
         "reverse_allow": 1,
-        "reverse_pwm_mid": -60,
-        "reverse_pwm_high": -180,
-        "error_curve_threshold": 1750,
-        "error_sharp_threshold": 3000,
-        "d_error_curve_threshold": 1350,
-        "d_error_sharp_threshold": 2250,
+        "reverse_pwm_mid": 0,
+        "reverse_pwm_high": -120,
+        "error_curve_threshold": 1900,
+        "error_sharp_threshold": 3200,
+        "d_error_curve_threshold": 1450,
+        "d_error_sharp_threshold": 2400,
         "search_pwm": 280,
         "line_loss_max_ms": 240,
     },
@@ -109,9 +108,9 @@ PROFILES = {
 
     "WIDE_U": {
         "label_ko": "완만한 U턴",
-        "base_speed": 930,
-        "curve_speed": 830,
-        "sharp_curve_speed": 700,
+        "base_speed": 950,
+        "curve_speed": 860,
+        "sharp_curve_speed": 720,
         "min_run_speed": 530,
         "kp_x1000": 560,
         "kd_x1000": 240,
@@ -151,7 +150,6 @@ PROFILES = {
 # ------------------------------------------------------------
 # Course section sequence
 # ------------------------------------------------------------
-
 COURSE_SECTIONS = [
     {
         "section_id": 0,
