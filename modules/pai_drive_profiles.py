@@ -1,6 +1,8 @@
 # modules/pai_drive_profiles.py
 # PAI-Car Pico 내부 코스 profile table
 #
+# FAST_V1
+#
 # 목적:
 #   - 경기 코스의 section 순서를 Pico 내부에 고정한다.
 #   - 각 section에 대응하는 profile 값을 Pico RAM에서 즉시 참조한다.
@@ -15,7 +17,7 @@
 #
 # 주의:
 #   - kp, kd는 MicroPython float 전송을 피하기 위해 x1000 정수로 저장한다.
-#   - 예: kp=0.52 -> kp_x1000=520
+#   - 예: kp=0.55 -> kp_x1000=550
 #   - 이 파일은 flash 저장/수정을 하지 않는다.
 #   - 실시간 튜닝은 나중에 RAM override 방식으로만 추가한다.
 
@@ -31,99 +33,99 @@ PROFILES = {
     "STRAIGHT": {
         "label_ko": "직진",
         "base_speed": 1000,
-        "curve_speed": 900,
-        "sharp_curve_speed": 740,
-        "min_run_speed": 520,
-        "kp_x1000": 500,
-        "kd_x1000": 200,
+        "curve_speed": 960,
+        "sharp_curve_speed": 820,
+        "min_run_speed": 560,
+        "kp_x1000": 550,
+        "kd_x1000": 220,
         "max_correction": 950,
         "reverse_allow": 0,
         "reverse_pwm_mid": 0,
         "reverse_pwm_high": 0,
-        "error_curve_threshold": 1500,
-        "error_sharp_threshold": 2500,
-        "d_error_curve_threshold": 1000,
-        "d_error_sharp_threshold": 1800,
+        "error_curve_threshold": 1600,
+        "error_sharp_threshold": 2700,
+        "d_error_curve_threshold": 1200,
+        "d_error_sharp_threshold": 2000,
         "search_pwm": 260,
         "line_loss_max_ms": 220,
     },
 
     "WIDE_S": {
         "label_ko": "넓은 S자",
-        "base_speed": 920,
-        "curve_speed": 810,
-        "sharp_curve_speed": 670,
-        "min_run_speed": 500,
-        "kp_x1000": 530,
-        "kd_x1000": 240,
-        "max_correction": 1050,
+        "base_speed": 980,
+        "curve_speed": 900,
+        "sharp_curve_speed": 760,
+        "min_run_speed": 560,
+        "kp_x1000": 550,
+        "kd_x1000": 220,
+        "max_correction": 1000,
         "reverse_allow": 1,
-        "reverse_pwm_mid": -120,
-        "reverse_pwm_high": -260,
-        "error_curve_threshold": 1350,
-        "error_sharp_threshold": 2350,
-        "d_error_curve_threshold": 900,
-        "d_error_sharp_threshold": 1600,
+        "reverse_pwm_mid": -80,
+        "reverse_pwm_high": -200,
+        "error_curve_threshold": 1500,
+        "error_sharp_threshold": 2500,
+        "d_error_curve_threshold": 1100,
+        "d_error_sharp_threshold": 1900,
         "search_pwm": 280,
         "line_loss_max_ms": 240,
     },
 
     "NARROW_S": {
         "label_ko": "좁은 S자",
-        "base_speed": 760,
-        "curve_speed": 680,
-        "sharp_curve_speed": 580,
-        "min_run_speed": 470,
-        "kp_x1000": 570,
-        "kd_x1000": 300,
-        "max_correction": 1150,
+        "base_speed": 930,
+        "curve_speed": 830,
+        "sharp_curve_speed": 700,
+        "min_run_speed": 530,
+        "kp_x1000": 560,
+        "kd_x1000": 240,
+        "max_correction": 1050,
         "reverse_allow": 1,
-        "reverse_pwm_mid": -220,
-        "reverse_pwm_high": -380,
-        "error_curve_threshold": 1150,
-        "error_sharp_threshold": 2100,
-        "d_error_curve_threshold": 750,
-        "d_error_sharp_threshold": 1400,
+        "reverse_pwm_mid": -120,
+        "reverse_pwm_high": -260,
+        "error_curve_threshold": 1300,
+        "error_sharp_threshold": 2250,
+        "d_error_curve_threshold": 900,
+        "d_error_sharp_threshold": 1600,
         "search_pwm": 300,
         "line_loss_max_ms": 280,
     },
 
     "HAIRPIN_U": {
         "label_ko": "헤어핀",
-        "base_speed": 620,
-        "curve_speed": 560,
-        "sharp_curve_speed": 500,
-        "min_run_speed": 430,
-        "kp_x1000": 620,
-        "kd_x1000": 340,
-        "max_correction": 1200,
+        "base_speed": 880,
+        "curve_speed": 780,
+        "sharp_curve_speed": 650,
+        "min_run_speed": 500,
+        "kp_x1000": 560,
+        "kd_x1000": 240,
+        "max_correction": 1100,
         "reverse_allow": 1,
-        "reverse_pwm_mid": -300,
-        "reverse_pwm_high": -460,
-        "error_curve_threshold": 1000,
-        "error_sharp_threshold": 1900,
-        "d_error_curve_threshold": 650,
-        "d_error_sharp_threshold": 1250,
+        "reverse_pwm_mid": -160,
+        "reverse_pwm_high": -320,
+        "error_curve_threshold": 1150,
+        "error_sharp_threshold": 2050,
+        "d_error_curve_threshold": 800,
+        "d_error_sharp_threshold": 1450,
         "search_pwm": 320,
         "line_loss_max_ms": 320,
     },
 
     "WIDE_U": {
         "label_ko": "완만한 U턴",
-        "base_speed": 800,
-        "curve_speed": 700,
-        "sharp_curve_speed": 600,
-        "min_run_speed": 480,
-        "kp_x1000": 550,
-        "kd_x1000": 270,
-        "max_correction": 1100,
+        "base_speed": 930,
+        "curve_speed": 830,
+        "sharp_curve_speed": 700,
+        "min_run_speed": 530,
+        "kp_x1000": 560,
+        "kd_x1000": 240,
+        "max_correction": 1050,
         "reverse_allow": 1,
-        "reverse_pwm_mid": -180,
-        "reverse_pwm_high": -320,
-        "error_curve_threshold": 1250,
-        "error_sharp_threshold": 2250,
-        "d_error_curve_threshold": 850,
-        "d_error_sharp_threshold": 1500,
+        "reverse_pwm_mid": -120,
+        "reverse_pwm_high": -260,
+        "error_curve_threshold": 1350,
+        "error_sharp_threshold": 2300,
+        "d_error_curve_threshold": 950,
+        "d_error_sharp_threshold": 1700,
         "search_pwm": 290,
         "line_loss_max_ms": 260,
     },
@@ -148,6 +150,7 @@ PROFILES = {
         "line_loss_max_ms": 300,
     },
 }
+
 
 # ------------------------------------------------------------
 # Course section sequence
@@ -264,6 +267,7 @@ COURSE_SECTIONS = [
     },
 ]
 
+
 # ------------------------------------------------------------
 # Helper functions
 # ------------------------------------------------------------
@@ -276,6 +280,13 @@ def clamp_int(value, min_value, max_value):
         return min_value
 
     return int(value)
+
+
+def div1000_trunc(value):
+    if value >= 0:
+        return value // 1000
+
+    return -((-value) // 1000)
 
 
 def get_section_count():
@@ -409,7 +420,7 @@ class DriveProfileManager:
             + self.profile["kd_x1000"] * d_error
         )
 
-        correction = int(total / 1000)
+        correction = div1000_trunc(total)
         max_correction = self.profile["max_correction"]
 
         return clamp_int(
@@ -436,7 +447,7 @@ class DriveProfileManager:
     def debug_text(self):
         return (
             "section={} no={} label={} type={} profile={} "
-            "base={} kp={} kd={} max_corr={}"
+            "base={} curve={} sharp={} kp={} kd={} max_corr={}"
         ).format(
             self.section_id,
             self.section_info.get("display_no", ""),
@@ -444,6 +455,8 @@ class DriveProfileManager:
             self.section_info.get("type", ""),
             self.profile_key,
             self.profile.get("base_speed", ""),
+            self.profile.get("curve_speed", ""),
+            self.profile.get("sharp_curve_speed", ""),
             self.profile.get("kp_x1000", ""),
             self.profile.get("kd_x1000", ""),
             self.profile.get("max_correction", ""),
