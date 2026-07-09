@@ -4,8 +4,8 @@
 # - single KP / KD tuning
 # - error-based speed control
 # - straight boost up to 1000
-# - U-turn / emergency curvature mode with time gate
-# - early gentle curve false-trigger prevention
+# - hard corner mode for right-angle / sharp corners
+# - late U-turn / emergency curvature mode
 # - simple motor mixer
 # - short strong line-loss recovery
 # - UDP telemetry/debug compatible
@@ -53,7 +53,7 @@ BASE_SPEED = 850
 MAX_SPEED = 1000
 MIN_SPEED = 420
 
-# 초반 완만한 커브에서 UTURN 오판 없이 일반 감속으로 버티기 위한 값.
+# 일반 고속 주행 감속 기준.
 SLOW_ERROR = 750
 HARD_ERROR = 1500
 
@@ -64,7 +64,7 @@ BOOST_ERROR = 220
 BOOST_D_ERROR = 70
 
 SPEED_RISE = 25
-SPEED_FALL = 120
+SPEED_FALL = 150
 
 
 # ------------------------------------------------------------
@@ -90,15 +90,33 @@ STRAIGHT_DAMP_GAIN_2 = 0.75
 
 
 # ------------------------------------------------------------
+# Hard corner mode
+# ------------------------------------------------------------
+
+# 중간 직각/급코너용.
+# UTURN보다 덜 과격하게 회전한다.
+HARD_CORNER_MIN_SPEED = 620
+
+HARD_CORNER_ENTRY_ERROR = 1050
+HARD_CORNER_ENTRY_D = 90
+HARD_CORNER_HARD_ERROR = 1900
+
+HARD_CORNER_HOLD_MS = 260
+
+HARD_CORNER_SPEED = 460
+HARD_CORNER_STEERING_LIMIT = 740
+HARD_CORNER_INNER_FLOOR = 60
+HARD_CORNER_OUTER_BOOST = 900
+
+
+# ------------------------------------------------------------
 # U-turn / emergency curvature mode
 # ------------------------------------------------------------
 
-# 마지막 U턴이 있는 구간 전까지는 UTURN 모드 발동 금지.
-# 초반 완만한 커브를 UTURN으로 오판하는 것을 막는다.
-UTURN_ENABLE_AFTER_MS = 6500
+# 마지막 U턴이 있는 후반 구간 전까지는 UTURN 모드 금지.
+# 중간 직각 코너가 UTURN처럼 처리되는 것을 막는다.
+UTURN_ENABLE_AFTER_MS = 32000
 
-# 실제로 “U턴 위치”를 아는 것이 아니라,
-# 고속 + 오차 증가 + 센서 끝 몰림 상태를 급곡률/U턴으로 간주한다.
 UTURN_MIN_SPEED = 650
 
 UTURN_ENTRY_ERROR = 1300
@@ -130,7 +148,6 @@ RIGHT_GAIN = 1.00
 ALLOW_REVERSE = False
 
 # 일반 추종 중 안쪽 바퀴 최소 출력.
-# UTURN 모드에서는 UTURN_INNER_FLOOR를 따로 사용한다.
 INNER_FLOOR = 120
 
 
@@ -138,7 +155,6 @@ INNER_FLOOR = 120
 # Line loss recovery
 # ------------------------------------------------------------
 
-# 고속형에서는 라인을 잃으면 짧고 강하게 돌린다.
 LOST_FORWARD = 250
 LOST_TURN = 900
 LOST_PIVOT_AFTER_MS = 120
@@ -195,10 +211,7 @@ def clamp(value, minimum, maximum):
     return value
 
 
-def move_speed(
-    current,
-    target,
-):
+def move_speed(current, target):
     if target > current:
         return min(
             current + SPEED_RISE,
@@ -336,7 +349,6 @@ def calculate_target_speed(
     else:
         target = BASE_SPEED
 
-    # 직선 안정 구간 boost.
     if (
         abs_error < BOOST_ERROR
         and abs(filtered_d) < BOOST_D_ERROR
@@ -373,7 +385,6 @@ def damp_steering_on_straight(
         filtered_d
     )
 
-    # 중심 근처이고 변화율도 작으면 직선으로 보고 잔류 조향을 빠르게 죽인다.
     if (
         abs_error < STRAIGHT_DAMP_ERROR_1
         and abs_d < STRAIGHT_DAMP_D_1
@@ -433,8 +444,43 @@ def calculate_steering(
 
 
 # ============================================================
-# U-turn detection
+# Corner detection
 # ============================================================
+
+def detect_hard_corner_entry(
+    filtered_error,
+    filtered_d,
+    current_speed,
+):
+    if current_speed < HARD_CORNER_MIN_SPEED:
+        return False
+
+    abs_error = abs(
+        filtered_error
+    )
+
+    abs_d = abs(
+        filtered_d
+    )
+
+    moving_away = (
+        filtered_error
+        * filtered_d
+        > 0
+    )
+
+    if abs_error >= HARD_CORNER_HARD_ERROR:
+        return True
+
+    if (
+        abs_error >= HARD_CORNER_ENTRY_ERROR
+        and abs_d >= HARD_CORNER_ENTRY_D
+        and moving_away
+    ):
+        return True
+
+    return False
+
 
 def detect_uturn_entry(
     filtered_error,
@@ -471,12 +517,9 @@ def detect_uturn_entry(
         > 0
     )
 
-    # 이미 크게 벗어났으면 즉시 급곡률 모드.
     if abs_error >= UTURN_HARD_ERROR:
         return True
 
-    # 일반 U턴 진입 조건:
-    # 고속 + 오차 큼 + 같은 방향으로 더 멀어짐 + 센서 끝 몰림.
     if (
         abs_error >= UTURN_ENTRY_ERROR
         and abs_d >= UTURN_ENTRY_D
@@ -485,7 +528,6 @@ def detect_uturn_entry(
     ):
         return True
 
-    # 센서 끝 몰림이 없어도 오차 증가가 매우 강하면 진입.
     if (
         abs_error >= UTURN_ENTRY_ERROR_STRONG
         and abs_d >= UTURN_ENTRY_D_STRONG
@@ -684,6 +726,7 @@ def send_debug_report(
     left_cmd,
     right_cmd,
     on_line,
+    in_hard_corner,
     in_uturn,
     uturn_detection_enabled,
 ):
@@ -712,6 +755,7 @@ def send_debug_report(
         "left={},"
         "right={},"
         "on_line={},"
+        "hard={},"
         "uturn={},"
         "uturn_enabled={}"
     ).format(
@@ -732,6 +776,7 @@ def send_debug_report(
         left_cmd,
         right_cmd,
         1 if on_line else 0,
+        1 if in_hard_corner else 0,
         1 if in_uturn else 0,
         1 if uturn_detection_enabled else 0,
     )
@@ -750,6 +795,7 @@ def send_final_report(
     max_loop_ms,
     total_compute_ms,
     line_lost_count,
+    hard_corner_entry_count,
     uturn_entry_count,
     telemetry_sent_count,
     telemetry_skip_count,
@@ -777,7 +823,7 @@ def send_final_report(
     message = (
         "type=final,"
         "finished={},"
-        "mode=HIGH_SPEED_UTURN_GATED,"
+        "mode=HIGH_SPEED_HARD_UTURN,"
         "control_ms={},"
         "loops={},"
         "average_compute_ms={:.3f},"
@@ -785,6 +831,7 @@ def send_final_report(
         "overrun_count={},"
         "overrun_rate={:.2f},"
         "line_lost_entry={},"
+        "hard_entry={},"
         "uturn_entry={},"
         "telemetry_sent={},"
         "telemetry_skip={},"
@@ -799,6 +846,7 @@ def send_final_report(
         overrun_count,
         overrun_rate,
         line_lost_count,
+        hard_corner_entry_count,
         uturn_entry_count,
         telemetry_sent_count,
         telemetry_skip_count,
@@ -819,10 +867,10 @@ def send_final_report(
 def show_running_mode(lap_timer):
     try:
         lap_timer.show(
-            "HIGH U-GATED",
+            "HIGH HARD U",
             "BASE {}".format(BASE_SPEED),
             "MAX {}".format(MAX_SPEED),
-            "U after {}ms".format(UTURN_ENABLE_AFTER_MS),
+            "U after {}".format(UTURN_ENABLE_AFTER_MS),
         )
     except Exception:
         pass
@@ -849,6 +897,7 @@ def run():
     last_loop_ms = 0
 
     line_lost_count = 0
+    hard_corner_entry_count = 0
     uturn_entry_count = 0
 
     telemetry_sent_count = 0
@@ -909,7 +958,7 @@ def run():
                 (
                     "type=boot,"
                     "telemetry_ok={},"
-                    "mode=HIGH_SPEED_UTURN_GATED,"
+                    "mode=HIGH_SPEED_HARD_UTURN,"
                     "control_ms={},"
                     "base_speed={},"
                     "max_speed={},"
@@ -917,9 +966,9 @@ def run():
                     "kd={:.3f},"
                     "slow_error={},"
                     "hard_error={},"
+                    "hard_speed={},"
                     "uturn_after={},"
-                    "uturn_speed={},"
-                    "uturn_hold={}"
+                    "uturn_speed={}"
                 ).format(
                     telemetry_ok,
                     CONTROL_MS,
@@ -929,9 +978,9 @@ def run():
                     KD,
                     SLOW_ERROR,
                     HARD_ERROR,
+                    HARD_CORNER_SPEED,
                     UTURN_ENABLE_AFTER_MS,
                     UTURN_SPEED,
-                    UTURN_HOLD_MS,
                 ),
             )
 
@@ -984,6 +1033,7 @@ def run():
         lost_start_ms = None
         previous_on_line = True
 
+        hard_corner_until_ms = 0
         uturn_until_ms = 0
 
         last_debug_report_ms = ticks_ms()
@@ -1037,6 +1087,27 @@ def run():
                 elapsed_run_ms >= UTURN_ENABLE_AFTER_MS
             )
 
+            # HARD_CORNER는 초반부터 허용한다.
+            if (
+                on_line
+                and detect_hard_corner_entry(
+                    filtered_error,
+                    filtered_d,
+                    current_speed,
+                )
+            ):
+                if ticks_diff(
+                    hard_corner_until_ms,
+                    now_ms,
+                ) <= 0:
+                    hard_corner_entry_count += 1
+
+                hard_corner_until_ms = (
+                    now_ms
+                    + HARD_CORNER_HOLD_MS
+                )
+
+            # UTURN은 후반에서만 허용한다.
             if (
                 on_line
                 and uturn_detection_enabled
@@ -1057,6 +1128,14 @@ def run():
                     now_ms
                     + UTURN_HOLD_MS
                 )
+
+            in_hard_corner = (
+                ticks_diff(
+                    hard_corner_until_ms,
+                    now_ms,
+                )
+                > 0
+            )
 
             in_uturn = (
                 ticks_diff(
@@ -1126,12 +1205,14 @@ def run():
                         "speed={},"
                         "error={},"
                         "filtered_error={:.1f},"
+                        "hard_entry={},"
                         "uturn_entry={}"
                     ).format(
                         loop_count,
                         current_speed,
                         error,
                         filtered_error,
+                        hard_corner_entry_count,
                         uturn_entry_count,
                     ),
                 )
@@ -1164,6 +1245,27 @@ def run():
                         steering,
                         UTURN_INNER_FLOOR,
                         outer_boost=UTURN_OUTER_BOOST,
+                    )
+
+                elif in_hard_corner:
+                    target_speed = HARD_CORNER_SPEED
+                    current_speed = HARD_CORNER_SPEED
+
+                    steering = calculate_steering(
+                        filtered_error,
+                        filtered_d,
+                        HARD_CORNER_STEERING_LIMIT,
+                        allow_straight_damping=False,
+                    )
+
+                    (
+                        left_cmd,
+                        right_cmd,
+                    ) = mix_motor(
+                        current_speed,
+                        steering,
+                        HARD_CORNER_INNER_FLOOR,
+                        outer_boost=HARD_CORNER_OUTER_BOOST,
                     )
 
                 else:
@@ -1343,6 +1445,7 @@ def run():
                             left_cmd,
                             right_cmd,
                             on_line,
+                            in_hard_corner,
                             in_uturn,
                             uturn_detection_enabled,
                         )
@@ -1424,6 +1527,7 @@ def run():
             max_loop_ms,
             total_compute_ms,
             line_lost_count,
+            hard_corner_entry_count,
             uturn_entry_count,
             telemetry_sent_count,
             telemetry_skip_count,
