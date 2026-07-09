@@ -4,6 +4,7 @@
 # - single KP / KD tuning
 # - error-based speed control
 # - straight boost up to 1000
+# - U-turn / emergency curvature mode
 # - simple motor mixer
 # - short strong line-loss recovery
 # - UDP telemetry/debug compatible
@@ -42,29 +43,24 @@ from modules.pai_car_wifi_config import (
 DEBUG_MODE = True
 CONTROL_MS = 10
 
+
 # ------------------------------------------------------------
 # Speed
 # ------------------------------------------------------------
 
-# 공격형 시작값.
-# 완주율보다 기록 단축 우선.
 BASE_SPEED = 850
 MAX_SPEED = 1000
 MIN_SPEED = 420
 
-# 오차 기반 감속.
 SLOW_ERROR = 850
 HARD_ERROR = 1800
 
 SLOW_SPEED = 680
 HARD_SPEED = 470
 
-# 직선 안정 시 1000 boost.
 BOOST_ERROR = 220
 BOOST_D_ERROR = 70
 
-# 속도 변화량.
-# 기존 5보다 훨씬 빠르게 가속.
 SPEED_RISE = 25
 SPEED_FALL = 120
 
@@ -79,12 +75,9 @@ KD = 0.42
 STEERING_LIMIT = 620
 ERROR_DEADBAND = 60
 
-# 필터.
 ERROR_ALPHA = 0.55
 D_ALPHA = 0.18
 
-# 직선 안정화.
-# 코너 탈출 후 잔류 조향이 직선에서 흔들림으로 번지는 것을 줄임.
 STRAIGHT_DAMP_ERROR_1 = 300
 STRAIGHT_DAMP_D_1 = 90
 STRAIGHT_DAMP_GAIN_1 = 0.55
@@ -92,6 +85,31 @@ STRAIGHT_DAMP_GAIN_1 = 0.55
 STRAIGHT_DAMP_ERROR_2 = 500
 STRAIGHT_DAMP_D_2 = 140
 STRAIGHT_DAMP_GAIN_2 = 0.75
+
+
+# ------------------------------------------------------------
+# U-turn / emergency curvature mode
+# ------------------------------------------------------------
+
+# 실제로 “U턴 위치”를 아는 것이 아니라,
+# 고속 + 오차 증가 + 센서 끝 몰림 상태를 급곡률/U턴으로 간주한다.
+UTURN_MIN_SPEED = 650
+
+UTURN_ENTRY_ERROR = 1300
+UTURN_ENTRY_D = 120
+
+UTURN_ENTRY_ERROR_STRONG = 1650
+UTURN_ENTRY_D_STRONG = 170
+
+UTURN_HARD_ERROR = 2300
+UTURN_EDGE_SUM = 1100
+
+UTURN_HOLD_MS = 420
+
+UTURN_SPEED = 380
+UTURN_STEERING_LIMIT = 850
+UTURN_INNER_FLOOR = 0
+UTURN_OUTER_BOOST = 1000
 
 
 # ------------------------------------------------------------
@@ -105,8 +123,8 @@ RIGHT_GAIN = 1.00
 
 ALLOW_REVERSE = False
 
-# 0이면 극공격형 회전.
-# 120은 속도형 안정 절충.
+# 일반 추종 중 안쪽 바퀴 최소 출력.
+# UTURN 모드에서는 UTURN_INNER_FLOOR를 따로 사용한다.
 INNER_FLOOR = 120
 
 
@@ -114,9 +132,10 @@ INNER_FLOOR = 120
 # Line loss recovery
 # ------------------------------------------------------------
 
-LOST_FORWARD = 300
-LOST_TURN = 650
-LOST_PIVOT_AFTER_MS = 180
+# 고속형에서는 라인을 잃으면 짧고 강하게 돌린다.
+LOST_FORWARD = 250
+LOST_TURN = 900
+LOST_PIVOT_AFTER_MS = 120
 
 
 # ------------------------------------------------------------
@@ -236,6 +255,16 @@ def count_active_sensors(norm):
     )
 
 
+def edge_sensor_sums(norm):
+    left_edge = norm[0] + norm[1]
+    right_edge = norm[6] + norm[7]
+
+    return (
+        left_edge,
+        right_edge,
+    )
+
+
 # ============================================================
 # Filter / speed / steering
 # ============================================================
@@ -301,8 +330,6 @@ def calculate_target_speed(
     else:
         target = BASE_SPEED
 
-    # 직선 안정 구간 boost.
-    # 직선이 긴 코스에서 기록 단축 핵심.
     if (
         abs_error < BOOST_ERROR
         and abs(filtered_d) < BOOST_D_ERROR
@@ -339,7 +366,6 @@ def damp_steering_on_straight(
         filtered_d
     )
 
-    # 중심 근처이고 변화율도 작으면 직선으로 보고 잔류 조향을 빠르게 죽인다.
     if (
         abs_error < STRAIGHT_DAMP_ERROR_1
         and abs_d < STRAIGHT_DAMP_D_1
@@ -366,6 +392,8 @@ def damp_steering_on_straight(
 def calculate_steering(
     filtered_error,
     filtered_d,
+    steering_limit,
+    allow_straight_damping=True,
 ):
     control_error = apply_error_deadband(
         filtered_error
@@ -380,19 +408,84 @@ def calculate_steering(
 
     steering = clamp(
         steering,
-        -STEERING_LIMIT,
-        STEERING_LIMIT,
+        -steering_limit,
+        steering_limit,
     )
 
-    steering = damp_steering_on_straight(
-        steering,
-        filtered_error,
-        filtered_d,
-    )
+    if allow_straight_damping:
+        steering = damp_steering_on_straight(
+            steering,
+            filtered_error,
+            filtered_d,
+        )
 
     return int(
         steering
     )
+
+
+# ============================================================
+# U-turn detection
+# ============================================================
+
+def detect_uturn_entry(
+    filtered_error,
+    filtered_d,
+    current_speed,
+    norm,
+):
+    if current_speed < UTURN_MIN_SPEED:
+        return False
+
+    abs_error = abs(
+        filtered_error
+    )
+
+    abs_d = abs(
+        filtered_d
+    )
+
+    (
+        left_edge,
+        right_edge,
+    ) = edge_sensor_sums(
+        norm
+    )
+
+    edge_strong = (
+        left_edge >= UTURN_EDGE_SUM
+        or right_edge >= UTURN_EDGE_SUM
+    )
+
+    moving_away = (
+        filtered_error
+        * filtered_d
+        > 0
+    )
+
+    # 이미 크게 벗어났으면 즉시 급곡률 모드.
+    if abs_error >= UTURN_HARD_ERROR:
+        return True
+
+    # 일반 U턴 진입 조건:
+    # 고속 + 오차 큼 + 같은 방향으로 더 멀어짐 + 센서 끝 몰림.
+    if (
+        abs_error >= UTURN_ENTRY_ERROR
+        and abs_d >= UTURN_ENTRY_D
+        and moving_away
+        and edge_strong
+    ):
+        return True
+
+    # 센서 끝 몰림이 없어도 오차 증가가 매우 강하면 진입.
+    if (
+        abs_error >= UTURN_ENTRY_ERROR_STRONG
+        and abs_d >= UTURN_ENTRY_D_STRONG
+        and moving_away
+    ):
+        return True
+
+    return False
 
 
 # ============================================================
@@ -402,6 +495,8 @@ def calculate_steering(
 def mix_motor(
     speed,
     steering,
+    inner_floor,
+    outer_boost=None,
 ):
     left = (
         speed
@@ -423,17 +518,28 @@ def mix_motor(
         if right < 0:
             right = 0
 
-    # 안쪽 바퀴가 완전히 죽으면 코너 탈출 흔들림이 커질 수 있음.
     if speed > 0:
         if left <= 0:
-            left = INNER_FLOOR
-        elif left < INNER_FLOOR:
-            left = INNER_FLOOR
+            left = inner_floor
+        elif left < inner_floor:
+            left = inner_floor
 
         if right <= 0:
-            right = INNER_FLOOR
-        elif right < INNER_FLOOR:
-            right = INNER_FLOOR
+            right = inner_floor
+        elif right < inner_floor:
+            right = inner_floor
+
+    if outer_boost is not None:
+        if steering > 0:
+            left = max(
+                left,
+                outer_boost,
+            )
+        elif steering < 0:
+            right = max(
+                right,
+                outer_boost,
+            )
 
     left = clamp(
         left,
@@ -570,6 +676,7 @@ def send_debug_report(
     left_cmd,
     right_cmd,
     on_line,
+    in_uturn,
 ):
     if debug_socket is None:
         return (
@@ -595,7 +702,8 @@ def send_debug_report(
         "steering={},"
         "left={},"
         "right={},"
-        "on_line={}"
+        "on_line={},"
+        "uturn={}"
     ).format(
         loop_count,
         target_speed,
@@ -614,6 +722,7 @@ def send_debug_report(
         left_cmd,
         right_cmd,
         1 if on_line else 0,
+        1 if in_uturn else 0,
     )
 
     return send_debug_message(
@@ -630,6 +739,7 @@ def send_final_report(
     max_loop_ms,
     total_compute_ms,
     line_lost_count,
+    uturn_entry_count,
     telemetry_sent_count,
     telemetry_skip_count,
     debug_skip_count,
@@ -656,7 +766,7 @@ def send_final_report(
     message = (
         "type=final,"
         "finished={},"
-        "mode=HIGH_SPEED,"
+        "mode=HIGH_SPEED_UTURN,"
         "control_ms={},"
         "loops={},"
         "average_compute_ms={:.3f},"
@@ -664,6 +774,7 @@ def send_final_report(
         "overrun_count={},"
         "overrun_rate={:.2f},"
         "line_lost_entry={},"
+        "uturn_entry={},"
         "telemetry_sent={},"
         "telemetry_skip={},"
         "debug_skip={},"
@@ -677,6 +788,7 @@ def send_final_report(
         overrun_count,
         overrun_rate,
         line_lost_count,
+        uturn_entry_count,
         telemetry_sent_count,
         telemetry_skip_count,
         debug_skip_count,
@@ -696,13 +808,10 @@ def send_final_report(
 def show_running_mode(lap_timer):
     try:
         lap_timer.show(
-            "HIGH SPEED",
+            "HIGH UTURN",
             "BASE {}".format(BASE_SPEED),
             "MAX {}".format(MAX_SPEED),
-            "KP {:.2f} KD {:.2f}".format(
-                KP,
-                KD,
-            ),
+            "U {}".format(UTURN_SPEED),
         )
     except Exception:
         pass
@@ -729,6 +838,7 @@ def run():
     last_loop_ms = 0
 
     line_lost_count = 0
+    uturn_entry_count = 0
 
     telemetry_sent_count = 0
     telemetry_skip_count = 0
@@ -788,12 +898,14 @@ def run():
                 (
                     "type=boot,"
                     "telemetry_ok={},"
-                    "mode=HIGH_SPEED,"
+                    "mode=HIGH_SPEED_UTURN,"
                     "control_ms={},"
                     "base_speed={},"
                     "max_speed={},"
                     "kp={:.3f},"
-                    "kd={:.3f}"
+                    "kd={:.3f},"
+                    "uturn_speed={},"
+                    "uturn_hold={}"
                 ).format(
                     telemetry_ok,
                     CONTROL_MS,
@@ -801,6 +913,8 @@ def run():
                     MAX_SPEED,
                     KP,
                     KD,
+                    UTURN_SPEED,
+                    UTURN_HOLD_MS,
                 ),
             )
 
@@ -853,6 +967,8 @@ def run():
         lost_start_ms = None
         previous_on_line = True
 
+        uturn_until_ms = 0
+
         last_debug_report_ms = ticks_ms()
 
         finish_confirm_count = 0
@@ -893,8 +1009,38 @@ def run():
             previous_filtered_error = filtered_error
             previous_filtered_d = filtered_d
 
+            now_ms = ticks_ms()
+
+            if (
+                on_line
+                and detect_uturn_entry(
+                    filtered_error,
+                    filtered_d,
+                    current_speed,
+                    norm,
+                )
+            ):
+                if ticks_diff(
+                    uturn_until_ms,
+                    now_ms,
+                ) <= 0:
+                    uturn_entry_count += 1
+
+                uturn_until_ms = (
+                    now_ms
+                    + UTURN_HOLD_MS
+                )
+
+            in_uturn = (
+                ticks_diff(
+                    uturn_until_ms,
+                    now_ms,
+                )
+                > 0
+            )
+
             elapsed_run_ms = ticks_diff(
-                ticks_ms(),
+                now_ms,
                 run_start_ms,
             )
 
@@ -957,12 +1103,14 @@ def run():
                         "loops={},"
                         "speed={},"
                         "error={},"
-                        "filtered_error={:.1f}"
+                        "filtered_error={:.1f},"
+                        "uturn_entry={}"
                     ).format(
                         loop_count,
                         current_speed,
                         error,
                         filtered_error,
+                        uturn_entry_count,
                     ),
                 )
 
@@ -975,28 +1123,54 @@ def run():
                 last_valid_error = filtered_error
                 lost_start_ms = None
 
-                target_speed = calculate_target_speed(
-                    filtered_error,
-                    filtered_d,
-                )
+                if in_uturn:
+                    target_speed = UTURN_SPEED
+                    current_speed = UTURN_SPEED
 
-                current_speed = move_speed(
-                    current_speed,
-                    target_speed,
-                )
+                    steering = calculate_steering(
+                        filtered_error,
+                        filtered_d,
+                        UTURN_STEERING_LIMIT,
+                        allow_straight_damping=False,
+                    )
 
-                steering = calculate_steering(
-                    filtered_error,
-                    filtered_d,
-                )
+                    (
+                        left_cmd,
+                        right_cmd,
+                    ) = mix_motor(
+                        current_speed,
+                        steering,
+                        UTURN_INNER_FLOOR,
+                        outer_boost=UTURN_OUTER_BOOST,
+                    )
 
-                (
-                    left_cmd,
-                    right_cmd,
-                ) = mix_motor(
-                    current_speed,
-                    steering,
-                )
+                else:
+                    target_speed = calculate_target_speed(
+                        filtered_error,
+                        filtered_d,
+                    )
+
+                    current_speed = move_speed(
+                        current_speed,
+                        target_speed,
+                    )
+
+                    steering = calculate_steering(
+                        filtered_error,
+                        filtered_d,
+                        STEERING_LIMIT,
+                        allow_straight_damping=True,
+                    )
+
+                    (
+                        left_cmd,
+                        right_cmd,
+                    ) = mix_motor(
+                        current_speed,
+                        steering,
+                        INNER_FLOOR,
+                        outer_boost=None,
+                    )
 
                 motors.drive(
                     left_cmd,
@@ -1147,6 +1321,7 @@ def run():
                             left_cmd,
                             right_cmd,
                             on_line,
+                            in_uturn,
                         )
 
                         if cost_ms > MAX_NETWORK_SEND_COST_MS:
@@ -1226,6 +1401,7 @@ def run():
             max_loop_ms,
             total_compute_ms,
             line_lost_count,
+            uturn_entry_count,
             telemetry_sent_count,
             telemetry_skip_count,
             debug_skip_count,
