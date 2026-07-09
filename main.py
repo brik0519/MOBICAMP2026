@@ -1,16 +1,16 @@
 # main.py
-# PAI-Car v1.0 profile 기반 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP 데이터 전송
+# PAI-Car v1.0 profile 기반 PD 제어 라인트레이싱 + 주행 시간 측정 + UDP telemetry V2
 #
 # 유지:
 #   - 엔코더 없는 모터 기준
-#   - UDP 기본 V1 telemetry 포맷 유지
 #   - 버튼 직후 시작선 중복 finish 오검출 방지
 #   - Z 긴급 정지 / Enter 재개
+#   - Space section advance
 #
 # 변경:
-#   - 고정 KP / KD / 속도값 대신 DriveProfileManager의 현재 section profile 사용
-#   - Space로 section 변경 시 Pico 내부 profile도 변경
-#   - section별 base_speed, curve_speed, kp, kd, max_correction, search_pwm 적용
+#   - telemetry V2에 Pico 실제 section/profile 상태 전송
+#   - telemetry V2에 마지막 command 처리 결과 전송
+#   - PC/Pico section sync 확인 가능
 
 from time import ticks_ms, ticks_diff, ticks_add
 
@@ -24,6 +24,8 @@ from modules.pai_car_run_support import (
 
 from modules.pai_udp_telemetry import (
     PAIUdpTelemetry,
+    RUN_STATE_STOP,
+    RUN_STATE_RUN,
     read_line_detail,
 )
 
@@ -72,6 +74,22 @@ def arm_start_marker_if_needed(lap_timer, norm, on_line):
         return True
 
     return False
+
+
+def update_telemetry_command_echo(
+    telemetry,
+    cmd,
+    drive_profiles,
+    run_state
+):
+    telemetry.set_command_echo(
+        run_state,
+        drive_profiles.get_section_id(),
+        drive_profiles.get_profile_key(),
+        cmd.get_last_cmd_seq(),
+        cmd.get_last_cmd_type(),
+        cmd.get_last_cmd_status()
+    )
 
 
 def send_stop_packet(
@@ -141,6 +159,14 @@ lap_timer.start()
 telemetry.reset_timer()
 
 drive_profiles.reset()
+
+update_telemetry_command_echo(
+    telemetry,
+    cmd,
+    drive_profiles,
+    RUN_STATE_RUN
+)
+
 print(drive_profiles.debug_text())
 
 run_start_ms = ticks_ms()
@@ -280,6 +306,13 @@ try:
                     motors.stop()
                     finished = True
 
+                    update_telemetry_command_echo(
+                        telemetry,
+                        cmd,
+                        drive_profiles,
+                        RUN_STATE_STOP
+                    )
+
                     send_stop_packet(
                         telemetry,
                         target_speed,
@@ -360,7 +393,23 @@ try:
                     motors.stop()
 
         # --------------------------------------------------------
-        # 5. 주행 데이터 전송
+        # 5. Telemetry V2 command/profile echo 갱신
+        # --------------------------------------------------------
+
+        if paused or force_stop:
+            run_state = RUN_STATE_STOP
+        else:
+            run_state = RUN_STATE_RUN
+
+        update_telemetry_command_echo(
+            telemetry,
+            cmd,
+            drive_profiles,
+            run_state
+        )
+
+        # --------------------------------------------------------
+        # 6. 주행 데이터 전송
         # --------------------------------------------------------
 
         telemetry.send_if_due(
@@ -376,14 +425,14 @@ try:
         )
 
         # --------------------------------------------------------
-        # 6. OLED 갱신
+        # 7. OLED 갱신
         # --------------------------------------------------------
 
         if not paused:
             lap_timer.update()
 
         # --------------------------------------------------------
-        # 7. 제어 주기 맞추기
+        # 8. 제어 주기 맞추기
         # --------------------------------------------------------
 
         wait_control_period(loop_start)
@@ -391,6 +440,14 @@ try:
 
 finally:
     motors.stop()
+
+    update_telemetry_command_echo(
+        telemetry,
+        cmd,
+        drive_profiles,
+        RUN_STATE_STOP
+    )
+
     telemetry.close()
     cmd.close()
 

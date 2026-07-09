@@ -6,8 +6,12 @@
 #   - UDP socket 생성
 #   - 주행 데이터를 binary packet으로 변환
 #   - 20ms 주기로 PC에 전송
+#   - telemetry V2에서 Pico 실제 section/profile 및 command 적용 결과를 함께 전송
 #
-# 이 파일은 학생들이 자주 볼 필요가 없는 통신 관련 코드를 모아 둔다.
+# 주의:
+#   - VERSION=2 packet은 기존 V1 dashboard parser가 바로 읽을 수 없다.
+#   - main.py에서 set_command_echo(...)를 호출해야 실제 command 상태가 packet에 반영된다.
+#   - main.py 수정 전에는 기본값이 전송된다.
 
 from time import ticks_ms, ticks_diff, sleep_ms
 import network
@@ -38,13 +42,39 @@ SEND_MS = 20
 
 WIFI_TIMEOUT_MS = 15000
 
-MAGIC = 0x5041     # packet identifier
-VERSION = 1
+MAGIC = 0x5041     # packet identifier: 'PA'
+VERSION = 2
 RESERVED = 0
 
 
 # ------------------------------------------------------------
-# Binary packet format
+# Runtime state / profile id mapping
+# ------------------------------------------------------------
+
+RUN_STATE_STOP = 0
+RUN_STATE_RUN = 1
+RUN_STATE_UNKNOWN = 255
+
+PROFILE_ID_SAFE = 0
+PROFILE_ID_STRAIGHT = 1
+PROFILE_ID_WIDE_S = 2
+PROFILE_ID_NARROW_S = 3
+PROFILE_ID_HAIRPIN_U = 4
+PROFILE_ID_WIDE_U = 5
+PROFILE_ID_UNKNOWN = 255
+
+PROFILE_ID_BY_KEY = {
+    "SAFE": PROFILE_ID_SAFE,
+    "STRAIGHT": PROFILE_ID_STRAIGHT,
+    "WIDE_S": PROFILE_ID_WIDE_S,
+    "NARROW_S": PROFILE_ID_NARROW_S,
+    "HAIRPIN_U": PROFILE_ID_HAIRPIN_U,
+    "WIDE_U": PROFILE_ID_WIDE_U,
+}
+
+
+# ------------------------------------------------------------
+# Binary packet format V2
 # ------------------------------------------------------------
 #
 # <      : little-endian
@@ -65,10 +95,63 @@ RESERVED = 0
 # B      : on_line, uint8
 # B      : is_marker, uint8
 #
-# Total: 44 bytes
+# V2 추가:
+# B      : run_state, uint8
+# B      : actual_section_id, uint8
+# B      : active_profile_id, uint8
+# H      : last_cmd_seq, uint16
+# B      : last_cmd_type, uint8
+# B      : last_cmd_status, uint8
+#
+# Total V1: 44 bytes
+# Total V2: 51 bytes
 
-PACKET_FORMAT = "<HBBHIHHh8HHhhhhBB"
+PACKET_FORMAT = "<HBBHIHHh8HHhhhhBBBBBHBB"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+
+
+# ------------------------------------------------------------
+# Clamp helpers
+# ------------------------------------------------------------
+
+def clamp_int(value, min_value, max_value):
+    try:
+        value = int(value)
+    except Exception:
+        value = min_value
+
+    if value < min_value:
+        return min_value
+
+    if value > max_value:
+        return max_value
+
+    return value
+
+
+def clamp_u8(value):
+    return clamp_int(value, 0, 255)
+
+
+def clamp_u16(value):
+    return clamp_int(value, 0, 65535)
+
+
+def clamp_u32(value):
+    return clamp_int(value, 0, 4294967295)
+
+
+def clamp_i16(value):
+    return clamp_int(value, -32768, 32767)
+
+
+def profile_key_to_id(profile_key):
+    profile_id = PROFILE_ID_BY_KEY.get(profile_key)
+
+    if profile_id is None:
+        return PROFILE_ID_UNKNOWN
+
+    return profile_id
 
 
 # ------------------------------------------------------------
@@ -136,6 +219,7 @@ class PAIUdpTelemetry:
         telemetry = PAIUdpTelemetry(lap_timer)
         telemetry.begin()
         telemetry.reset_timer()
+        telemetry.set_command_echo(...)
         telemetry.send_if_due(...)
         telemetry.send_now(...)
         telemetry.close()
@@ -152,6 +236,14 @@ class PAIUdpTelemetry:
         self.last_send_ms = ticks_ms()
 
         self.enabled = False
+
+        # Telemetry V2 command/profile echo fields.
+        self.run_state = RUN_STATE_RUN
+        self.actual_section_id = 0
+        self.active_profile_id = PROFILE_ID_UNKNOWN
+        self.last_cmd_seq = 0
+        self.last_cmd_type = 0
+        self.last_cmd_status = 0
 
     def begin(self):
         """
@@ -170,14 +262,15 @@ class PAIUdpTelemetry:
 
             print("UDP telemetry ready")
             print("Target:", PC_IP, PC_PORT)
+            print("Telemetry version:", VERSION)
             print("Packet size:", PACKET_SIZE)
 
             if self.lap_timer is not None:
                 self.lap_timer.show(
-                    "UDP READY",
+                    "UDP READY V{}".format(VERSION),
                     PC_IP[:16],
                     "port {}".format(PC_PORT),
-                    ""
+                    "{} bytes".format(PACKET_SIZE)
                 )
 
             return True
@@ -199,6 +292,39 @@ class PAIUdpTelemetry:
         now = ticks_ms()
         self.run_start_ms = now
         self.last_send_ms = now
+        self.seq = 0
+
+    def set_command_echo(
+        self,
+        run_state,
+        actual_section_id,
+        active_profile_key,
+        last_cmd_seq,
+        last_cmd_type,
+        last_cmd_status
+    ):
+        """
+        telemetry V2에 실어 보낼 Pico 실제 command/profile 상태를 갱신한다.
+
+        run_state:
+            0 STOP, 1 RUN
+
+        actual_section_id:
+            Pico가 실제 적용 중인 DriveProfileManager section_id
+
+        active_profile_key:
+            "STRAIGHT", "WIDE_S", "NARROW_S", "HAIRPIN_U", "WIDE_U", "SAFE"
+
+        last_cmd_seq / last_cmd_type / last_cmd_status:
+            Pico command receiver가 마지막으로 적용한 command 결과
+        """
+
+        self.run_state = clamp_u8(run_state)
+        self.actual_section_id = clamp_u8(actual_section_id)
+        self.active_profile_id = profile_key_to_id(active_profile_key)
+        self.last_cmd_seq = clamp_u16(last_cmd_seq)
+        self.last_cmd_type = clamp_u8(last_cmd_type)
+        self.last_cmd_status = clamp_u8(last_cmd_status)
 
     def send_if_due(
         self,
@@ -359,28 +485,35 @@ class PAIUdpTelemetry:
                 MAGIC,
                 VERSION,
                 RESERVED,
-                self.seq,
-                int(t_ms),
-                CONTROL_MS,
-                SEND_MS,
-                int(base_speed),
+                clamp_u16(self.seq),
+                clamp_u32(t_ms),
+                clamp_u16(CONTROL_MS),
+                clamp_u16(SEND_MS),
+                clamp_i16(base_speed),
 
-                int(norm[0]),
-                int(norm[1]),
-                int(norm[2]),
-                int(norm[3]),
-                int(norm[4]),
-                int(norm[5]),
-                int(norm[6]),
-                int(norm[7]),
+                clamp_u16(norm[0]),
+                clamp_u16(norm[1]),
+                clamp_u16(norm[2]),
+                clamp_u16(norm[3]),
+                clamp_u16(norm[4]),
+                clamp_u16(norm[5]),
+                clamp_u16(norm[6]),
+                clamp_u16(norm[7]),
 
-                int(position),
-                int(error),
-                int(d_error),
-                int(left_cmd),
-                int(right_cmd),
+                clamp_u16(position),
+                clamp_i16(error),
+                clamp_i16(d_error),
+                clamp_i16(left_cmd),
+                clamp_i16(right_cmd),
                 1 if on_line else 0,
-                1 if is_marker else 0
+                1 if is_marker else 0,
+
+                clamp_u8(self.run_state),
+                clamp_u8(self.actual_section_id),
+                clamp_u8(self.active_profile_id),
+                clamp_u16(self.last_cmd_seq),
+                clamp_u8(self.last_cmd_type),
+                clamp_u8(self.last_cmd_status),
             )
 
             self.sock.sendto(packet, (PC_IP, PC_PORT))
