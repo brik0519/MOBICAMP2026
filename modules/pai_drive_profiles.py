@@ -30,7 +30,7 @@ MOTOR_CMD_MAX = 1000
 PROFILES = {
     "STRAIGHT": {
         "label_ko": "직진",
-        "base_speed": 1050,
+        "base_speed": 1000,
         "curve_speed": 900,
         "sharp_curve_speed": 740,
         "min_run_speed": 520,
@@ -50,9 +50,9 @@ PROFILES = {
 
     "WIDE_S": {
         "label_ko": "넓은 S자",
-        "base_speed": 880,
-        "curve_speed": 780,
-        "sharp_curve_speed": 650,
+        "base_speed": 920,
+        "curve_speed": 810,
+        "sharp_curve_speed": 670,
         "min_run_speed": 500,
         "kp_x1000": 530,
         "kd_x1000": 240,
@@ -70,9 +70,9 @@ PROFILES = {
 
     "NARROW_S": {
         "label_ko": "좁은 S자",
-        "base_speed": 720,
-        "curve_speed": 650,
-        "sharp_curve_speed": 560,
+        "base_speed": 760,
+        "curve_speed": 680,
+        "sharp_curve_speed": 580,
         "min_run_speed": 470,
         "kp_x1000": 570,
         "kd_x1000": 300,
