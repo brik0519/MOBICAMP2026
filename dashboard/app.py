@@ -5,6 +5,7 @@
 #   - Pico 2 W telemetry V2 packet 수신
 #   - Pico 실제 section/profile/command 상태 표시
 #   - ACK TIMEOUT이 있어도 telemetry actual_section_id로 PC section 동기화
+#   - profiles.json의 profile 값을 각 telemetry row에 snapshot으로 기록
 #   - Space: NEXT_SECTION, Z: STOP, Enter: RUN, P: PING
 #   - 주행 CSV와 section mark CSV 저장
 #
@@ -214,6 +215,32 @@ SECTION_MARK_HEADER = [
     "bad_packet_count",
 ]
 
+PROFILE_SNAPSHOT_HEADER = [
+    "profile_set",
+    "profile_version",
+    "profile_source_key",
+    "profile_label_ko",
+    "profile_base_speed",
+    "profile_curve_speed",
+    "profile_sharp_curve_speed",
+    "profile_min_run_speed",
+    "profile_kp",
+    "profile_kd",
+    "profile_max_correction",
+    "profile_reverse_allow",
+    "profile_reverse_pwm_mid",
+    "profile_reverse_pwm_high",
+    "profile_error_curve_threshold",
+    "profile_error_sharp_threshold",
+    "profile_d_error_curve_threshold",
+    "profile_d_error_sharp_threshold",
+    "profile_search_pwm",
+    "profile_line_loss_max_ms",
+]
+
+CSV_HEADER += PROFILE_SNAPSHOT_HEADER
+SECTION_MARK_HEADER += PROFILE_SNAPSHOT_HEADER
+
 
 # ------------------------------------------------------------
 # Qt key compatibility
@@ -222,6 +249,7 @@ SECTION_MARK_HEADER = [
 def get_qt_key(name):
     if hasattr(QtCore.Qt, "Key"):
         return getattr(QtCore.Qt.Key, name)
+
     return getattr(QtCore.Qt, name)
 
 
@@ -246,19 +274,114 @@ def set_text_selectable(label):
 # ------------------------------------------------------------
 
 FALLBACK_SECTIONS = [
-    {"section_id": 0, "display_no": 1, "name": "start_zone", "label_ko": "시작구간", "type": "WIDE_S", "profile_key": "WIDE_S", "role": "START"},
-    {"section_id": 1, "display_no": 2, "name": "long_straight", "label_ko": "긴 직진 구간", "type": "STRAIGHT", "profile_key": "STRAIGHT", "role": "NORMAL"},
-    {"section_id": 2, "display_no": 3, "name": "short_s_1", "label_ko": "짧은 S자", "type": "NARROW_S", "profile_key": "NARROW_S", "role": "NORMAL"},
-    {"section_id": 3, "display_no": 4, "name": "short_straight_1", "label_ko": "짧은 직진", "type": "STRAIGHT", "profile_key": "STRAIGHT", "role": "NORMAL"},
-    {"section_id": 4, "display_no": 5, "name": "wide_s_1", "label_ko": "넓은 S자", "type": "WIDE_S", "profile_key": "WIDE_S", "role": "NORMAL"},
-    {"section_id": 5, "display_no": 6, "name": "narrow_s_1", "label_ko": "좁은 S자", "type": "NARROW_S", "profile_key": "NARROW_S", "role": "NORMAL"},
-    {"section_id": 6, "display_no": 7, "name": "hairpin_approach", "label_ko": "헤어핀 진입 준비구간", "type": "HAIRPIN_U", "profile_key": "HAIRPIN_U", "role": "HAIRPIN_APPROACH"},
-    {"section_id": 7, "display_no": 8, "name": "hairpin_u_1", "label_ko": "헤어핀", "type": "HAIRPIN_U", "profile_key": "HAIRPIN_U", "role": "NORMAL"},
-    {"section_id": 8, "display_no": 9, "name": "middle_straight", "label_ko": "중간 직진구간", "type": "STRAIGHT", "profile_key": "STRAIGHT", "role": "NORMAL"},
-    {"section_id": 9, "display_no": 10, "name": "wide_u_1", "label_ko": "완만한 U턴", "type": "WIDE_U", "profile_key": "WIDE_U", "role": "NORMAL"},
-    {"section_id": 10, "display_no": 11, "name": "short_straight_2", "label_ko": "짧은 직진", "type": "STRAIGHT", "profile_key": "STRAIGHT", "role": "NORMAL"},
-    {"section_id": 11, "display_no": 12, "name": "half_narrow_s", "label_ko": "좁은 S자 절반", "type": "NARROW_S", "profile_key": "NARROW_S", "role": "NORMAL"},
-    {"section_id": 12, "display_no": 13, "name": "finish_short_straight", "label_ko": "Finish 전 짧은 직진", "type": "STRAIGHT", "profile_key": "STRAIGHT", "role": "FINISH_APPROACH"},
+    {
+        "section_id": 0,
+        "display_no": 1,
+        "name": "start_zone",
+        "label_ko": "시작구간",
+        "type": "WIDE_S",
+        "profile_key": "WIDE_S",
+        "role": "START",
+    },
+    {
+        "section_id": 1,
+        "display_no": 2,
+        "name": "long_straight",
+        "label_ko": "긴 직진 구간",
+        "type": "STRAIGHT",
+        "profile_key": "STRAIGHT",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 2,
+        "display_no": 3,
+        "name": "short_s_1",
+        "label_ko": "짧은 S자",
+        "type": "NARROW_S",
+        "profile_key": "NARROW_S",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 3,
+        "display_no": 4,
+        "name": "short_straight_1",
+        "label_ko": "짧은 직진",
+        "type": "STRAIGHT",
+        "profile_key": "STRAIGHT",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 4,
+        "display_no": 5,
+        "name": "wide_s_1",
+        "label_ko": "넓은 S자",
+        "type": "WIDE_S",
+        "profile_key": "WIDE_S",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 5,
+        "display_no": 6,
+        "name": "narrow_s_1",
+        "label_ko": "좁은 S자",
+        "type": "NARROW_S",
+        "profile_key": "NARROW_S",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 6,
+        "display_no": 7,
+        "name": "hairpin_entry_and_u",
+        "label_ko": "헤어핀 진입+헤어핀",
+        "type": "HAIRPIN_U",
+        "profile_key": "HAIRPIN_U",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 7,
+        "display_no": 8,
+        "name": "middle_straight",
+        "label_ko": "중간 직진구간",
+        "type": "STRAIGHT",
+        "profile_key": "STRAIGHT",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 8,
+        "display_no": 9,
+        "name": "wide_u_1",
+        "label_ko": "완만한 U턴",
+        "type": "WIDE_U",
+        "profile_key": "WIDE_U",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 9,
+        "display_no": 10,
+        "name": "short_straight_2",
+        "label_ko": "짧은 직진",
+        "type": "STRAIGHT",
+        "profile_key": "STRAIGHT",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 10,
+        "display_no": 11,
+        "name": "half_narrow_s",
+        "label_ko": "좁은 S자 절반",
+        "type": "NARROW_S",
+        "profile_key": "NARROW_S",
+        "role": "NORMAL",
+    },
+    {
+        "section_id": 11,
+        "display_no": 12,
+        "name": "finish_short_straight",
+        "label_ko": "Finish 전 짧은 직진",
+        "type": "STRAIGHT",
+        "profile_key": "STRAIGHT",
+        "role": "FINISH_APPROACH",
+    },
 ]
 
 
@@ -266,6 +389,7 @@ def load_json_file(path, default_value):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+
     except Exception:
         return default_value
 
@@ -277,6 +401,9 @@ class CourseModel:
 
         self.course_name = course.get("course_name", "unknown_course")
         self.sections = course.get("sections") or FALLBACK_SECTIONS
+
+        self.profile_set = profiles_doc.get("profile_set", "")
+        self.profile_version = profiles_doc.get("version", "")
         self.profiles = profiles_doc.get("profiles", {})
 
         self.sections_by_id = {}
@@ -315,6 +442,32 @@ class CourseModel:
     def get_profile(self, profile_key):
         return self.profiles.get(profile_key, {})
 
+    def get_profile_snapshot(self, profile_key):
+        profile = self.get_profile(profile_key)
+
+        return {
+            "profile_set": self.profile_set,
+            "profile_version": self.profile_version,
+            "profile_source_key": profile_key,
+            "profile_label_ko": profile.get("label_ko", ""),
+            "profile_base_speed": profile.get("base_speed", ""),
+            "profile_curve_speed": profile.get("curve_speed", ""),
+            "profile_sharp_curve_speed": profile.get("sharp_curve_speed", ""),
+            "profile_min_run_speed": profile.get("min_run_speed", ""),
+            "profile_kp": profile.get("kp", ""),
+            "profile_kd": profile.get("kd", ""),
+            "profile_max_correction": profile.get("max_correction", ""),
+            "profile_reverse_allow": profile.get("reverse_allow", ""),
+            "profile_reverse_pwm_mid": profile.get("reverse_pwm_mid", ""),
+            "profile_reverse_pwm_high": profile.get("reverse_pwm_high", ""),
+            "profile_error_curve_threshold": profile.get("error_curve_threshold", ""),
+            "profile_error_sharp_threshold": profile.get("error_sharp_threshold", ""),
+            "profile_d_error_curve_threshold": profile.get("d_error_curve_threshold", ""),
+            "profile_d_error_sharp_threshold": profile.get("d_error_sharp_threshold", ""),
+            "profile_search_pwm": profile.get("search_pwm", ""),
+            "profile_line_loss_max_ms": profile.get("line_loss_max_ms", ""),
+        }
+
 
 # ------------------------------------------------------------
 # Packet parsing
@@ -324,14 +477,17 @@ def parse_packet(data: bytes):
     if len(data) == PACKET_SIZE_V2:
         packet_format = PACKET_FORMAT_V2
         expected_version = VERSION_V2
+
     elif len(data) == PACKET_SIZE_V1:
         packet_format = PACKET_FORMAT_V1
         expected_version = VERSION_V1
+
     else:
         return None, "bad_size:{}".format(len(data))
 
     try:
         values = struct.unpack(packet_format, data)
+
     except struct.error:
         return None, "struct_error"
 
@@ -365,6 +521,7 @@ def parse_packet(data: bytes):
         last_cmd_seq = values[26]
         last_cmd_type = values[27]
         last_cmd_status = values[28]
+
     else:
         run_state = 255
         actual_section_id = 255
@@ -460,12 +617,14 @@ class CommandSender:
                 int(param_id),
                 int(value),
             )
+
         except struct.error as exc:
             self.last_error_text = "PACK_ERROR {}".format(exc)
             return None
 
         try:
             self.sock.sendto(packet, (self.target_ip, self.target_port))
+
         except OSError as exc:
             self.last_error_text = "SOCKET_ERROR {}".format(exc)
             return None
@@ -520,8 +679,10 @@ class CommandSender:
         while True:
             try:
                 data, addr = self.sock.recvfrom(128)
+
             except BlockingIOError:
                 break
+
             except OSError:
                 break
 
@@ -538,7 +699,10 @@ class CommandSender:
             ack["pending"] = pending_info
 
             if pending_info is not None:
-                self.last_rtt_ms = int((time.monotonic() - pending_info["sent_time"]) * 1000)
+                self.last_rtt_ms = int(
+                    (time.monotonic() - pending_info["sent_time"]) * 1000
+                )
+
             else:
                 self.last_rtt_ms = -1
 
@@ -593,6 +757,7 @@ class CommandSender:
                 ACK_FORMAT,
                 data,
             )
+
         except struct.error:
             return None
 
@@ -621,6 +786,7 @@ class CommandSender:
     def close(self):
         try:
             self.sock.close()
+
         except OSError:
             pass
 
@@ -647,13 +813,24 @@ class Dashboard(QtWidgets.QMainWindow):
         os.makedirs(LOG_DIR, exist_ok=True)
         now_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        self.csv_path = os.path.join(LOG_DIR, "pai_car_pyqt_{}.csv".format(now_name))
+        self.csv_path = os.path.join(
+            LOG_DIR,
+            "pai_car_pyqt_{}.csv".format(now_name),
+        )
         self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_HEADER)
         self.csv_writer.writeheader()
 
-        self.section_marks_path = os.path.join(LOG_DIR, "section_marks_{}.csv".format(now_name))
-        self.section_marks_file = open(self.section_marks_path, "w", newline="", encoding="utf-8")
+        self.section_marks_path = os.path.join(
+            LOG_DIR,
+            "section_marks_{}.csv".format(now_name),
+        )
+        self.section_marks_file = open(
+            self.section_marks_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+        )
         self.section_marks_writer = csv.DictWriter(
             self.section_marks_file,
             fieldnames=SECTION_MARK_HEADER,
@@ -714,7 +891,11 @@ class Dashboard(QtWidgets.QMainWindow):
 
         self.plot_position = self.graph.addPlot(row=0, col=0, title="position")
         self.plot_error = self.graph.addPlot(row=1, col=0, title="error / d_error")
-        self.plot_motor = self.graph.addPlot(row=2, col=0, title="left_cmd / right_cmd / base_speed")
+        self.plot_motor = self.graph.addPlot(
+            row=2,
+            col=0,
+            title="left_cmd / right_cmd / base_speed",
+        )
         self.plot_state = self.graph.addPlot(row=3, col=0, title="on_line / is_marker")
 
         self.plot_position.setYRange(0, 7000)
@@ -722,7 +903,12 @@ class Dashboard(QtWidgets.QMainWindow):
         self.plot_motor.setYRange(-1100, 1100)
         self.plot_state.setYRange(-0.1, 1.2)
 
-        for plot in [self.plot_position, self.plot_error, self.plot_motor, self.plot_state]:
+        for plot in [
+            self.plot_position,
+            self.plot_error,
+            self.plot_motor,
+            self.plot_state,
+        ]:
             plot.showGrid(x=True, y=True)
             plot.setLabel("bottom", "time", units="s")
 
@@ -765,8 +951,10 @@ class Dashboard(QtWidgets.QMainWindow):
         while True:
             try:
                 data, addr = self.sock.recvfrom(RECV_BUFFER_SIZE)
+
             except BlockingIOError:
                 break
+
             except OSError:
                 break
 
@@ -795,6 +983,18 @@ class Dashboard(QtWidgets.QMainWindow):
             row["pc_section_label"] = section.get("label_ko", "")
             row["pc_profile_key"] = section.get("profile_key", "")
             row["section_mismatch"] = self.is_section_mismatch(row)
+
+            # profiles.json 기준 profile snapshot을 telemetry row에 함께 저장한다.
+            # 우선 Pico가 보내준 active_profile_key를 사용하고,
+            # V1 packet 또는 UNKNOWN이면 PC section의 profile_key로 fallback한다.
+            profile_key_for_snapshot = row.get("active_profile_key", "")
+
+            if profile_key_for_snapshot in ("", "UNKNOWN"):
+                profile_key_for_snapshot = row["pc_profile_key"]
+
+            row.update(
+                self.course.get_profile_snapshot(profile_key_for_snapshot)
+            )
 
             t_sec = row["t_ms"] / 1000.0
 
@@ -881,8 +1081,12 @@ class Dashboard(QtWidgets.QMainWindow):
 
         if cmd_type == CMD_NEXT_SECTION:
             meta = pending.get("meta", {})
-            from_id = self.course.clamp_section_id(meta.get("from_section_id", self.pc_section_id))
-            to_id = self.course.clamp_section_id(meta.get("to_section_id", from_id))
+            from_id = self.course.clamp_section_id(
+                meta.get("from_section_id", self.pc_section_id)
+            )
+            to_id = self.course.clamp_section_id(
+                meta.get("to_section_id", from_id)
+            )
 
             if not is_timeout and int(status) == 0:
                 # telemetry가 이미 actual_section_id로 보정했다면 여기서 다시 증가시키지 않는다.
@@ -896,8 +1100,12 @@ class Dashboard(QtWidgets.QMainWindow):
         meta = pending.get("meta", {})
         snapshot = meta.get("snapshot_row") or self.last_row or {}
 
-        from_id = self.course.clamp_section_id(meta.get("from_section_id", self.pc_section_id))
-        to_id = self.course.clamp_section_id(meta.get("to_section_id", from_id))
+        from_id = self.course.clamp_section_id(
+            meta.get("from_section_id", self.pc_section_id)
+        )
+        to_id = self.course.clamp_section_id(
+            meta.get("to_section_id", from_id)
+        )
 
         from_section = self.course.get_section(from_id)
         to_section = self.course.get_section(to_id)
@@ -905,6 +1113,7 @@ class Dashboard(QtWidgets.QMainWindow):
         if is_timeout:
             status_value = "TIMEOUT"
             status_name = "TIMEOUT"
+
         else:
             status_value = int(result.get("status", -1))
             status_name = STATUS_NAMES.get(status_value, str(status_value))
@@ -914,7 +1123,10 @@ class Dashboard(QtWidgets.QMainWindow):
             "event": meta.get("event", CMD_NAMES.get(result.get("cmd_type", 0), "CMD")),
             "cmd_seq": result.get("cmd_seq", pending.get("cmd_seq", "")),
             "cmd_type": result.get("cmd_type", pending.get("cmd_type", "")),
-            "cmd_type_name": CMD_NAMES.get(result.get("cmd_type", pending.get("cmd_type", 0)), ""),
+            "cmd_type_name": CMD_NAMES.get(
+                result.get("cmd_type", pending.get("cmd_type", 0)),
+                "",
+            ),
             "cmd_status": status_value,
             "cmd_status_name": status_name,
             "ack_rtt_ms": result.get("rtt_ms", ""),
@@ -945,13 +1157,19 @@ class Dashboard(QtWidgets.QMainWindow):
             "bad_packet_count": self.bad_packet_count,
         }
 
-        self.section_marks_writer.writerow(self.filter_csv_row(row, SECTION_MARK_HEADER))
+        for key in PROFILE_SNAPSHOT_HEADER:
+            row[key] = snapshot.get(key, "")
+
+        self.section_marks_writer.writerow(
+            self.filter_csv_row(row, SECTION_MARK_HEADER)
+        )
         self.section_marks_file.flush()
 
     def keyPressEvent(self, event):
         try:
             if event.isAutoRepeat():
                 return
+
         except Exception:
             pass
 
@@ -980,7 +1198,9 @@ class Dashboard(QtWidgets.QMainWindow):
         elapsed_ms = int((now - self.last_next_section_time) * 1000)
 
         if elapsed_ms < NEXT_SECTION_MIN_INTERVAL_MS:
-            self.command.last_error_text = "NEXT_SECTION ignored: debounce {}ms".format(elapsed_ms)
+            self.command.last_error_text = (
+                "NEXT_SECTION ignored: debounce {}ms".format(elapsed_ms)
+            )
             return
 
         if self.command.has_pending_next_section():
@@ -994,7 +1214,11 @@ class Dashboard(QtWidgets.QMainWindow):
             self.command.last_error_text = "NEXT_SECTION ignored: already last section"
             return
 
-        result = self.command.send_next_section(from_id, to_id, self.last_row)
+        result = self.command.send_next_section(
+            from_id,
+            to_id,
+            self.last_row,
+        )
 
         if result is not None:
             self.last_next_section_time = now
@@ -1003,6 +1227,7 @@ class Dashboard(QtWidgets.QMainWindow):
         if self.received_count > 0:
             denom = self.received_count + self.packet_loss_count
             loss_rate = self.packet_loss_count * 100.0 / denom if denom > 0 else 0.0
+
         else:
             loss_rate = 0.0
 
@@ -1019,11 +1244,13 @@ class Dashboard(QtWidgets.QMainWindow):
             current = "no packet yet"
             pico_section_text = "Pico section=unknown"
             mismatch_text = ""
+
         else:
             pico_section_text = (
                 "Pico actual_section={actual_section_id} profile={active_profile_key} "
                 "run_state={run_state_name} last_cmd={last_cmd_type_name} "
-                "seq={last_cmd_seq} status={last_cmd_status_name}"
+                "seq={last_cmd_seq} status={last_cmd_status_name} "
+                "profile_set={profile_set} kp={profile_kp} kd={profile_kd}"
             ).format(**self.last_row)
 
             mismatch = self.is_section_mismatch(self.last_row)
@@ -1099,7 +1326,12 @@ class Dashboard(QtWidgets.QMainWindow):
             if x_max <= x_min:
                 x_max = x_min + 1.0
 
-            for plot in [self.plot_position, self.plot_error, self.plot_motor, self.plot_state]:
+            for plot in [
+                self.plot_position,
+                self.plot_error,
+                self.plot_motor,
+                self.plot_state,
+            ]:
                 plot.setXRange(x_min, x_max, padding=0)
 
         self.update_status_label()
@@ -1117,22 +1349,26 @@ class Dashboard(QtWidgets.QMainWindow):
         try:
             self.csv_file.flush()
             self.csv_file.close()
+
         except Exception:
             pass
 
         try:
             self.section_marks_file.flush()
             self.section_marks_file.close()
+
         except Exception:
             pass
 
         try:
             self.sock.close()
+
         except Exception:
             pass
 
         try:
             self.command.close()
+
         except Exception:
             pass
 
@@ -1150,7 +1386,11 @@ def main():
     window = Dashboard()
     window.show()
 
-    code = app.exec()
+    if hasattr(app, "exec"):
+        code = app.exec()
+
+    else:
+        code = app.exec_()
 
     window.close_resources()
 
